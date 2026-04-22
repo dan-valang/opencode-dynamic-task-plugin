@@ -96,6 +96,7 @@ function registerBackgroundTask(client, state) {
       path: { id: active.parentSessionId },
       body: { parts: [{ type: "text", text: timeoutMessage }] },
     });
+    backgroundTasks.delete(state.childSessionId);
   }, state.timeoutMs);
 
   backgroundTasks.set(state.childSessionId, state);
@@ -431,5 +432,110 @@ describe("Background Task Completion Notification", () => {
     }
 
     console.log("✅ Multiple rapid completions PASSED");
+  });
+
+  // --- Task 4: Runtime regression tests ---
+
+  it("classifies sync session.updated error as error-kind notification", async () => {
+    const client = createMockClient();
+    const childSessionId = "sync_error_child";
+    registerBackgroundTask(client, {
+      childSessionId,
+      parentSessionId: "sync_err_parent",
+      description: "Sync error test",
+      agentName: "general",
+      timeoutMs: 30000,
+      startedAt: Date.now(),
+      timeoutNotified: false,
+      timeoutHandle: null,
+    });
+
+    const event = {
+      type: "sync",
+      name: "session.updated.1",
+      data: { info: { status: { type: "error" } } },
+      properties: { sessionID: childSessionId },
+    };
+
+    await handleChildLifecycleEvent(client, event);
+
+    assert.strictEqual(notifications.length, 1, "Should notify exactly once");
+    assert.match(
+      notifications[0].message,
+      /ended with an error/i,
+      "Should be error-kind notification"
+    );
+    assert.ok(
+      !notifications[0].message.includes("completed successfully"),
+      "Must NOT be a success notification"
+    );
+
+    console.log("✅ Sync error classification PASSED");
+  });
+
+  it("removes timed-out tasks from backgroundTasks after notifying", async () => {
+    const client = createMockClient();
+    const childSessionId = "cleanup_child";
+    const parentSessionId = "cleanup_parent";
+
+    registerBackgroundTask(client, {
+      childSessionId,
+      parentSessionId,
+      description: "Cleanup test",
+      agentName: "general",
+      timeoutMs: 50,
+      startedAt: Date.now(),
+      timeoutNotified: false,
+      timeoutHandle: null,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    assert.strictEqual(
+      backgroundTasks.has(childSessionId),
+      false,
+      "backgroundTasks must delete the entry after timeout fires"
+    );
+
+    console.log("✅ Timeout cleanup PASSED");
+  });
+
+  it("only one notification sent when lifecycle event fires before timeout", async () => {
+    const client = createMockClient();
+    const childSessionId = "race_child";
+    registerBackgroundTask(client, {
+      childSessionId,
+      parentSessionId: "race_parent",
+      description: "Race test",
+      agentName: "general",
+      timeoutMs: 999999,
+      startedAt: Date.now(),
+      timeoutNotified: false,
+      timeoutHandle: null,
+    });
+
+    await handleChildLifecycleEvent(client, {
+      type: "session.idle",
+      properties: { sessionID: childSessionId, status: "idle" },
+    });
+
+    assert.strictEqual(notifications.length, 1, "Only 1 notification (completion), timeout must not also fire");
+    assert.match(notifications[0].message, /completed/i);
+
+    console.log("✅ Race condition guard PASSED");
+  });
+
+  it("ignores lifecycle event for untracked session", async () => {
+    const client = createMockClient();
+    const notificationsBefore = notifications.length;
+
+    await handleChildLifecycleEvent(client, {
+      type: "session.idle",
+      properties: { sessionID: "nonexistent_session", status: "idle" },
+    });
+
+    assert.strictEqual(notifications.length, notificationsBefore, "No notification for untracked session");
+
+    console.log("✅ Untracked session ignored PASSED");
   });
 });
