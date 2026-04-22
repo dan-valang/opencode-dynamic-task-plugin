@@ -10,6 +10,11 @@ import {
   isTerminalSessionEvent,
   MAX_CONCURRENT_TASKS,
 } from "./shared/session-lifecycle.js";
+import {
+  buildBackgroundPrompt,
+  formatParentNotification,
+  formatTaskResultSummary,
+} from "./shared/task-formatting.js";
 
 interface Agent {
   name: string;
@@ -195,54 +200,7 @@ async function pollForResponse(
   return `(Timed out after ${maxWaitMs / 1000}s. Session: ${sessionId})`;
 }
 
-function formatParentNotification(
-  state: BackgroundTaskState,
-  kind: "timeout" | "completed" | "completed_after_timeout" | "error",
-  resultText: string = ""
-): string {
-  const safeResult = truncateText(resultText || "(No text output)");
 
-  if (kind === "timeout") {
-    return [
-      "[dynamic-task-notify]",
-      `Child task timed out while waiting for response (${Math.round(state.timeoutMs / 1000)}s).`,
-      `Session: ${state.childSessionId}`,
-      `Description: ${state.description}`,
-      "This is an automated notification.",
-    ].join("\n");
-  }
-
-  if (kind === "error") {
-    return [
-      "[dynamic-task-notify]",
-      "Child task ended with an error state.",
-      `Session: ${state.childSessionId}`,
-      `Description: ${state.description}`,
-      `Latest output: ${safeResult}`,
-      "This is an automated notification.",
-    ].join("\n");
-  }
-
-  if (kind === "completed_after_timeout") {
-    return [
-      "[dynamic-task-notify]",
-      "Child task finished after an earlier timeout notification.",
-      `Session: ${state.childSessionId}`,
-      `Description: ${state.description}`,
-      `Latest output: ${safeResult}`,
-      "This is an automated notification.",
-    ].join("\n");
-  }
-
-  return [
-    "[dynamic-task-notify]",
-    "Child task completed.",
-    `Session: ${state.childSessionId}`,
-    `Description: ${state.description}`,
-    `Latest output: ${safeResult}`,
-    "This is an automated notification.",
-  ].join("\n");
-}
 
 async function notifyParentSession(client: any, parentSessionId: string, message: string): Promise<void> {
   try {
@@ -419,9 +377,10 @@ export default async function dynamicTaskPlugin({
             }
 
             const baselineCount = await getMessageCount(client, childSessionId);
+            const childPrompt = shouldAwait ? args.prompt : buildBackgroundPrompt(args.prompt);
             await client.session.prompt({
               path: { id: childSessionId },
-              body: { parts: [{ type: "text", text: args.prompt }] },
+              body: { parts: [{ type: "text", text: childPrompt }] },
             });
 
             if (!shouldAwait) {
@@ -441,6 +400,7 @@ export default async function dynamicTaskPlugin({
                   `Spawned @${agent.name} in background.`,
                   `Session: ${childSessionId}`,
                   `Async notification: enabled (parent ${parentSessionId})`,
+                  "Use task_result(session_id=...) to inspect progress while it runs.",
                 ].join("\n");
               }
 
@@ -516,17 +476,16 @@ export default async function dynamicTaskPlugin({
             const status = normalizeStatus(sessionInfo?.status || sessionInfo?.body?.status) || "unknown";
             const messages = await readSessionMessages(client, args.session_id);
             const latest = getLatestAssistantText(messages, 0) || "(No assistant text found)";
+            const tracked = backgroundTasks.get(args.session_id);
 
-            return [
-              "## Task Result",
-              "",
-              `Session: ${args.session_id}`,
-              `Status: ${status}`,
-              `Messages: ${messages.length}`,
-              "",
-              "### Latest Assistant Output",
-              latest,
-            ].join("\n");
+            return formatTaskResultSummary({
+              sessionId: args.session_id,
+              status,
+              messageCount: messages.length,
+              latestText: latest,
+              tracked: Boolean(tracked),
+              timeoutNotified: Boolean(tracked?.timeoutNotified),
+            });
           } catch (error: any) {
             if (error.message?.includes("not found")) {
               return `ERROR: Session "${args.session_id}" not found.`;

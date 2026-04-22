@@ -373,3 +373,98 @@ describe("isTerminalSessionEvent", () => {
     );
   });
 });
+
+// --- Shared Task Formatting Helpers (Task 2) ---
+import {
+  buildBackgroundPrompt,
+  formatParentNotification,
+  formatTaskResultSummary,
+} from "../../dist/shared/task-formatting.js";
+
+describe("buildBackgroundPrompt", () => {
+  it("adds explicit background instructions before user prompt", () => {
+    const result = buildBackgroundPrompt("Return COMPLETED_OK when done.");
+    assert.match(result, /You are running as a background child task\./);
+    assert.match(result, /Return a final, self-contained answer\./);
+    assert.match(result, /Return COMPLETED_OK when done\./);
+  });
+});
+
+describe("formatParentNotification", () => {
+  it("formats timeout with next-step guidance", () => {
+    const message = formatParentNotification(
+      { childSessionId: "ses_1", description: "Quick task", timeoutMs: 30000 },
+      "timeout"
+    );
+    assert.match(message, /Background task did not report completion before timeout/);
+    assert.match(message, /Use task_result to inspect the latest state\./);
+  });
+
+  it("formats error with recovery guidance", () => {
+    const message = formatParentNotification(
+      { childSessionId: "ses_1", description: "Quick task", timeoutMs: 30000 },
+      "error",
+      "Something failed"
+    );
+    assert.match(message, /Background task ended with an error\./);
+    assert.match(message, /Use task_result or task_continue to inspect or recover\./);
+  });
+
+  it("formats completed_after_timeout explicitly", () => {
+    const message = formatParentNotification(
+      { childSessionId: "ses_1", description: "Quick task", timeoutMs: 30000 },
+      "completed_after_timeout",
+      "Done late"
+    );
+    assert.match(message, /Background task completed after an earlier timeout notification\./);
+  });
+
+  it("formats successful completion", () => {
+    const message = formatParentNotification(
+      { childSessionId: "ses_1", description: "Quick task", timeoutMs: 30000 },
+      "completed",
+      "COMPLETED_OK"
+    );
+    assert.match(message, /Background task completed successfully\./);
+    assert.match(message, /Latest output: COMPLETED_OK/);
+  });
+});
+
+describe("formatTaskResultSummary", () => {
+  it("includes next action guidance for running tasks", () => {
+    const result = formatTaskResultSummary({
+      sessionId: "ses_123",
+      status: "busy",
+      messageCount: 4,
+      latestText: "Still working",
+      tracked: true,
+      timeoutNotified: false,
+    });
+    assert.match(result, /Recommended next action: use task_result again later\./);
+  });
+
+  it("includes recovery guidance for error status", () => {
+    const result = formatTaskResultSummary({
+      sessionId: "ses_123",
+      status: "error",
+      messageCount: 4,
+      latestText: "Failed",
+      tracked: true,
+      timeoutNotified: false,
+    });
+    assert.match(result, /Recommended next action: inspect latest output/);
+  });
+
+  it("includes tracked and timeout metadata", () => {
+    const result = formatTaskResultSummary({
+      sessionId: "ses_123",
+      status: "idle",
+      messageCount: 4,
+      latestText: "Done",
+      tracked: true,
+      timeoutNotified: true,
+    });
+    assert.match(result, /Tracked background task: yes/);
+    assert.match(result, /Timeout notification sent: yes/);
+  });
+});
