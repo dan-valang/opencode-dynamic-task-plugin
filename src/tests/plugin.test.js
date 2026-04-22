@@ -468,3 +468,38 @@ describe("formatTaskResultSummary", () => {
     assert.match(result, /Timeout notification sent: yes/);
   });
 });
+
+// --- Debug Logger (Task 3) ---
+import { getDebugLogPath, safeDebugPayload } from "../../dist/debug-logger.js";
+
+describe("safeDebugPayload", () => {
+  it("keeps event metadata but removes blocked fields (prompt, fullPrompt)", () => {
+    const payload = safeDebugPayload({
+      eventType: "session.status",
+      prompt: "x".repeat(5000),
+      latestText: "done",
+    });
+    assert.strictEqual(payload.eventType, "session.status");
+    assert.ok(!("prompt" in payload));
+    assert.strictEqual(payload.latestText, "done");
+  });
+
+  it("caps logged fields at MAX_DEBUG_FIELDS (4)", () => {
+    const payload = safeDebugPayload({
+      a: 1, b: 2, c: 3, d: 4, e: 5, f: 6,
+    });
+    assert.strictEqual(Object.keys(payload).length, 4, "Must not log more than 4 fields");
+  });
+
+  it("respects DYNAMIC_TASK_DEBUG_BLOCKLIST env var", () => {
+    const result = safeDebugPayload({ prompt: "x", token: "secret", latestText: "done" });
+    assert.ok(!("prompt" in result), "prompt must be blocked by default blocklist");
+  });
+});
+
+describe("getDebugLogPath", () => {
+  it("creates a stable per-parent-child path", () => {
+    const logPath = getDebugLogPath("parent_1", "child_2");
+    assert.match(logPath, /parent-parent_1__child-child_2\.log$/);
+  });
+});

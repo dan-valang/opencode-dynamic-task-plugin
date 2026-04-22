@@ -15,6 +15,7 @@ import {
   formatParentNotification,
   formatTaskResultSummary,
 } from "./shared/task-formatting.js";
+import { debugLog } from "./debug-logger.js";
 
 interface Agent {
   name: string;
@@ -237,6 +238,12 @@ function registerBackgroundTask(client: any, state: BackgroundTaskState): void {
     active.timeoutNotified = true;
     const timeoutMessage = formatParentNotification(active, "timeout");
     await notifyParentSession(client, active.parentSessionId, timeoutMessage);
+    backgroundTasks.delete(state.childSessionId);
+
+    debugLog(active.parentSessionId, active.childSessionId, "timeout-fired", {
+      timeoutMs: active.timeoutMs,
+      timeoutNotified: active.timeoutNotified,
+    });
   }, state.timeoutMs);
 
   backgroundTasks.set(state.childSessionId, state);
@@ -276,6 +283,13 @@ async function handleChildLifecycleEvent(client: any, event: any): Promise<void>
   } else if (tracked.timeoutNotified) {
     kind = "completed_after_timeout";
   }
+
+  debugLog(tracked.parentSessionId, childSessionId, "child-lifecycle-event", {
+    eventType,
+    status,
+    kind,
+    timeoutNotified: tracked.timeoutNotified,
+  });
 
   const parentMessage = formatParentNotification(tracked, kind, latestText);
   await notifyParentSession(client, tracked.parentSessionId, parentMessage);
@@ -394,6 +408,12 @@ export default async function dynamicTaskPlugin({
                   startedAt: Date.now(),
                   timeoutNotified: false,
                   timeoutHandle: null,
+                });
+
+                debugLog(parentSessionId, childSessionId, "background-task-registered", {
+                  timeoutMs,
+                  description: args.description || `Task: ${agent.name}`,
+                  shouldAwait: false,
                 });
 
                 return [
