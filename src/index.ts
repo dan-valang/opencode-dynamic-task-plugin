@@ -33,6 +33,7 @@ interface BackgroundTaskState {
   timeoutMs: number;
   startedAt: number;
   timeoutNotified: boolean;
+  completed: boolean;
   timeoutHandle: ReturnType<typeof setTimeout> | null;
 }
 
@@ -95,6 +96,11 @@ function extractSessionStatus(sessionInfo: any): string {
   for (const c of candidates) {
     const normalized = normalizeStatus(c);
     if (normalized) return normalized;
+  }
+  // Log full response shape when status can't be determined — helps debug API shape
+  if (sessionInfo) {
+    const shape = JSON.stringify(sessionInfo, null, 2).slice(0, 500);
+    debugLog("status-debug", "status-debug", "unknown-status-shape", { shape });
   }
   return "unknown";
 }
@@ -271,6 +277,8 @@ async function handleChildLifecycleEvent(client: any, event: any): Promise<void>
 
   const tracked = backgroundTasks.get(childSessionId);
   if (!tracked) return;
+  if (tracked.completed) return; // already notified, prevent duplicate
+  tracked.completed = true;
 
   if (tracked.timeoutHandle) {
     clearTimeout(tracked.timeoutHandle);
@@ -456,6 +464,7 @@ export default async function dynamicTaskPlugin({
                   timeoutMs,
                   startedAt: Date.now(),
                   timeoutNotified: false,
+                  completed: false,
                   timeoutHandle: null,
                 });
 
@@ -561,12 +570,12 @@ export default async function dynamicTaskPlugin({
             // Safety net: if session is done but background task still has a pending timeout,
             // cancel the timeout and clean up. This catches cases where the event handler
             // missed the completion event.
-            if (tracked && !tracked.timeoutNotified && ["idle", "completed", "error"].includes(status)) {
+            if (tracked && !tracked.timeoutNotified && !tracked.completed && ["idle", "completed", "error"].includes(status)) {
               if (tracked.timeoutHandle) {
                 clearTimeout(tracked.timeoutHandle);
                 tracked.timeoutHandle = null;
               }
-              tracked.timeoutNotified = false; // completed, not timed out
+              tracked.completed = true;
               debugLog(tracked.parentSessionId, args.session_id, "safety-net-cleanup", {
                 status,
                 source: "task_result",
@@ -577,11 +586,12 @@ export default async function dynamicTaskPlugin({
             // Fallback safety net: if status is "unknown" but the session has meaningful
             // assistant output and is tracked, cancel the timeout anyway. The task clearly
             // completed — we just can't determine the exact status field.
-            if (tracked && !tracked.timeoutNotified && status === "unknown" && latest.trim() && latest !== "(No assistant text found)" && messages.length >= 2) {
+            if (tracked && !tracked.timeoutNotified && !tracked.completed && status === "unknown" && latest.trim() && latest !== "(No assistant text found)" && messages.length >= 2) {
               if (tracked.timeoutHandle) {
                 clearTimeout(tracked.timeoutHandle);
                 tracked.timeoutHandle = null;
               }
+              tracked.completed = true;
               debugLog(tracked.parentSessionId, args.session_id, "safety-net-fallback", {
                 status,
                 messageCount: messages.length,
