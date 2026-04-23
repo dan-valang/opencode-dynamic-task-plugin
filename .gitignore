@@ -6,3 +6,23 @@ dist/
 
 # Dependencies
 node_modules/
+
+# Test session files
+*-session-*.md
+dt*-session-*.md
+dynatool*-session-*.md
+ft*-session-*.md
+t*-session-*.md
+session-*.md
+
+# Temp files
+combined.log
+error.log
+
+# Knowledge/memory (generated)
+knowledge/
+.memory-forge/
+
+# Plan files
+plan-review-*.md
+dynamic-task-plugin-fixes-implementation-plan.md
