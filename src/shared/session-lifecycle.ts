@@ -30,11 +30,21 @@ export function getSessionIdFromEvent(event: any): string | null {
 }
 
 export function getEventLifecycleStatus(event: any): string {
-  return (
-    normalizeStatus(event?.properties?.status) ||
-    normalizeStatus(event?.data?.info?.status) ||
-    ""
-  );
+  const candidates = [
+    event?.properties?.status,
+    event?.data?.info?.status,
+    event?.data?.status,
+    event?.info?.status,
+    event?.status,
+    event?.body?.status,
+    event?.body?.info?.status,
+    event?.properties?.info?.status,
+  ];
+  for (const c of candidates) {
+    const normalized = normalizeStatus(c);
+    if (normalized) return normalized;
+  }
+  return "";
 }
 
 const TERMINAL_STATUSES = ["idle", "completed", "error", "deleted"];

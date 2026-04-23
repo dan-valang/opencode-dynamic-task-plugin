@@ -83,6 +83,22 @@ function extractTextFromParts(parts: any[]): string {
     .join("\n");
 }
 
+function extractSessionStatus(sessionInfo: any): string {
+  const candidates = [
+    sessionInfo?.status,
+    sessionInfo?.body?.status,
+    sessionInfo?.data?.status,
+    sessionInfo?.data?.info?.status,
+    sessionInfo?.info?.status,
+    sessionInfo?.body?.info?.status,
+  ];
+  for (const c of candidates) {
+    const normalized = normalizeStatus(c);
+    if (normalized) return normalized;
+  }
+  return "unknown";
+}
+
 function extractMessages(result: any): any[] {
   if (Array.isArray(result)) return result;
   if (Array.isArray(result?.data)) return result.data;
@@ -178,7 +194,7 @@ async function pollForResponse(
       if (latest.trim()) return latest;
 
       const sessionInfo = await client.session.get({ path: { id: sessionId } });
-      const status = normalizeStatus(sessionInfo?.status || sessionInfo?.body?.status);
+      const status = extractSessionStatus(sessionInfo);
 
       if (status === "idle" || status === "completed" || status === "error") {
         const finalMessages = await readSessionMessages(client, sessionId);
@@ -323,26 +339,40 @@ export default async function dynamicTaskPlugin({
 
   return {
     event: async ({ event }: any) => {
-      // Diagnostic: log every event to help diagnose event handler issues
+      // Always-on diagnostic: log every event via client.app.log
+      const eventType = event?.type;
+      const eventName = event?.name;
+      const evtSessionId = getSessionIdFromEvent(event);
+      const evtStatus = getEventLifecycleStatus(event);
+      const topKeys = event ? Object.keys(event).slice(0, 8).join(",") : "(null)";
+
+      await client.app.log({
+        body: {
+          service: "dynamic-task",
+          level: "info",
+          message: `event: type=${eventType} name=${eventName} sid=${evtSessionId} status=${evtStatus} keys=[${topKeys}]`,
+        },
+      });
+
       debugLog("event-handler", "event-handler", "event-received", {
-        type: event?.type,
-        name: event?.name,
-        sessionId: getSessionIdFromEvent(event),
-        status: getEventLifecycleStatus(event),
+        type: eventType,
+        name: eventName,
+        sessionId: evtSessionId,
+        status: evtStatus,
       });
 
       try {
         await handleChildLifecycleEvent(client, event);
       } catch (e: any) {
-        debugLog("event-handler", "event-handler", "event-handler-error", {
-          error: e?.message,
-        });
         await client.app.log({
           body: {
             service: "dynamic-task",
             level: "warn",
-            message: `Event handler error: ${e?.message}`,
+            message: `event handler error: ${e?.message}`,
           },
+        });
+        debugLog("event-handler", "event-handler", "event-handler-error", {
+          error: e?.message,
         });
       }
     },
@@ -512,7 +542,18 @@ export default async function dynamicTaskPlugin({
 
           try {
             const sessionInfo = await client.session.get({ path: { id: args.session_id } });
-            const status = normalizeStatus(sessionInfo?.status || sessionInfo?.body?.status) || "unknown";
+            const status = extractSessionStatus(sessionInfo);
+
+            // Always-on diagnostic: log raw sessionInfo structure
+            const infoKeys = sessionInfo ? Object.keys(sessionInfo).slice(0, 8).join(",") : "(null)";
+            const bodyKeys = sessionInfo?.body ? Object.keys(sessionInfo.body).slice(0, 8).join(",") : "(none)";
+            await client.app.log({
+              body: {
+                service: "dynamic-task",
+                level: "info",
+                message: `task_result: sid=${args.session_id} status=${status} info.keys=[${infoKeys}] body.keys=[${bodyKeys}] raw.status=${JSON.stringify(sessionInfo?.status)} raw.body.status=${JSON.stringify(sessionInfo?.body?.status)}`,
+              },
+            });
             const messages = await readSessionMessages(client, args.session_id);
             const latest = getLatestAssistantText(messages, 0) || "(No assistant text found)";
             const tracked = backgroundTasks.get(args.session_id);
@@ -528,6 +569,23 @@ export default async function dynamicTaskPlugin({
               tracked.timeoutNotified = false; // completed, not timed out
               debugLog(tracked.parentSessionId, args.session_id, "safety-net-cleanup", {
                 status,
+                source: "task_result",
+              });
+              backgroundTasks.delete(args.session_id);
+            }
+
+            // Fallback safety net: if status is "unknown" but the session has meaningful
+            // assistant output and is tracked, cancel the timeout anyway. The task clearly
+            // completed — we just can't determine the exact status field.
+            if (tracked && !tracked.timeoutNotified && status === "unknown" && latest.trim() && latest !== "(No assistant text found)" && messages.length >= 2) {
+              if (tracked.timeoutHandle) {
+                clearTimeout(tracked.timeoutHandle);
+                tracked.timeoutHandle = null;
+              }
+              debugLog(tracked.parentSessionId, args.session_id, "safety-net-fallback", {
+                status,
+                messageCount: messages.length,
+                hasOutput: true,
                 source: "task_result",
               });
               backgroundTasks.delete(args.session_id);
