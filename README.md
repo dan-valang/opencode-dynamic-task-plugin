@@ -1,42 +1,83 @@
 # OpenCode Dynamic Task Plugin
 
-OpenCode plugin that provides `task()`, `task_continue()`, and `task_interrupt()` tools for dynamic subagent execution.
+OpenCode plugin that provides `dynamic_task`, `task_continue`, `task_result`, and `task_interrupt` tools for dynamic subagent execution with async background mode and automatic parent notifications.
 
 ## Features
 
-- **dynamic_task** — Spawn any registered subagent with a prompt
+- **dynamic_task** — Spawn any registered subagent with a prompt, optionally in background mode
 - **task_continue** — Send follow-up messages to running child sessions
+- **task_result** — Inspect latest known child session status/output without sending a new prompt
 - **task_interrupt** — Abort running child sessions
-- Configurable timeout per request (`timeout_ms` argument or `DYNAMIC_TASK_TIMEOUT` env)
-- Async/fire-and-forget mode (`await_response: false`)
+- Async/fire-and-forget mode (`await_response: false`) with automatic parent notifications
+- Configurable timeout per request
 - Automatic agent discovery and caching
 - Child session tracking with `parentID`
+- Opt-in debug logging for troubleshooting
 
 ## Installation
 
-1. Ensure the plugin file is at `~/.config/opencode/plugins/dynamic-task.ts` (auto-scanned by OpenCode)
-2. Restart OpenCode
+1. Add the plugin to your OpenCode profile's `plugin` array:
+   ```jsonc
+   "plugin": [
+     "file:///path/to/dynamic-task-plugin/src/index.ts"
+   ]
+   ```
+2. Run `npm install` in the plugin directory
+3. Restart OpenCode
 
 ## Usage
+
+### Spawn a task (blocking — waits for response)
 
 ```
 dynamic_task(description="Analyze codebase", subagent_type="explore", prompt="Find all TODO comments in src/")
 ```
 
-Fire-and-forget (doesn't block):
+### Spawn a background task (non-blocking)
+
 ```
-dynamic_task(description="Background task", subagent_type="general", prompt="...", await_response=false)
+dynamic_task(description="Background analysis", subagent_type="general", prompt="Summarize the architecture", await_response=false)
 ```
 
-Continue a session:
+When `await_response: false`, the plugin:
+1. Creates a child session with the specified subagent
+2. Wraps the prompt with explicit background-task instructions
+3. Returns immediately with the child session ID
+4. Sends an automated `[dynamic-task-notify]` message to the parent when the child completes
+5. Tracks the child with a configurable timeout (default 120s)
+
+### Check task result
+
+```
+task_result(session_id="ses_xxx")
+```
+
+Returns the latest known status, message count, and assistant output. Use this to poll for progress on background tasks.
+
+### Continue a session
+
 ```
 task_continue(session_id="ses_xxx", prompt="Now also check the tests")
 ```
 
-Interrupt:
+### Interrupt a session
+
 ```
 task_interrupt(session_id="ses_xxx")
 ```
+
+## Background Task Notifications
+
+When a background task completes, the parent session receives a `[dynamic-task-notify]` message. Notification types:
+
+| Type | Trigger |
+|------|---------|
+| `completed successfully` | Child session finished with output |
+| `ended with an error` | Child session ended in error state |
+| `did not report completion before timeout` | Timeout elapsed without completion event |
+| `completed after an earlier timeout` | Child completed after timeout notification was already sent |
+
+Each child session triggers **exactly one** notification. Duplicate notifications are prevented by a completion guard.
 
 ## Configuration
 
@@ -44,6 +85,31 @@ task_interrupt(session_id="ses_xxx")
 |-------------|-------------|---------|
 | `DYNAMIC_TASK_CACHE_TTL` | Agent list cache duration (ms) | `300000` (5 min) |
 | `DYNAMIC_TASK_TIMEOUT` | Default wait timeout (ms) | `120000` (2 min) |
+| `DYNAMIC_TASK_MAX_CONCURRENT` | Max concurrent background tasks per parent session | `4` |
+| `DYNAMIC_TASK_DEBUG` | Enable debug logging (`1` = on) | `0` |
+| `DYNAMIC_TASK_DEBUG_BLOCKLIST` | Comma-separated field names to exclude from debug logs (max 4) | `prompt,fullPrompt` |
+
+## Debug Logging
+
+Set `DYNAMIC_TASK_DEBUG=1` to write per-session logs under `.dynamic-task-logs/`.
+
+Each log file is named:
+```
+parent-<parentSessionId>__child-<childSessionId>.log
+```
+
+The log contains event metadata only (event type/name, normalized status, timeout/completion decisions). It does not store full prompts. Field blocklisting is configurable via `DYNAMIC_TASK_DEBUG_BLOCKLIST`.
+
+## Architecture
+
+```
+src/
+├── index.ts                      # Plugin entry point, tool handlers, event router
+├── debug-logger.ts               # Opt-in file-based debug logging
+└── shared/
+    ├── session-lifecycle.ts      # Status normalization, event parsing, terminal detection
+    └── task-formatting.ts        # Notification formatting, background prompt wrapper
+```
 
 ## Development
 
@@ -54,9 +120,27 @@ npm install
 # Run tests
 npm test
 
-# Build
+# Type check
+npm run lint
+
+# Build (produces dist/)
 npm run build
+
+# Watch mode
+npm run watch
+
+# Debug mode (writes log files)
+DYNAMIC_TASK_DEBUG=1 npm test
 ```
+
+## Verification
+
+```bash
+npm run lint      # TypeScript type check
+npm test          # Full test suite (60 tests)
+```
+
+Expected: lint passes, all 60 tests pass.
 
 ## License
 
