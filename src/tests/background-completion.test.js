@@ -18,7 +18,6 @@ import {
 } from "../../dist/shared/session-lifecycle.js";
 import {
   formatParentNotification,
-  truncateText,
 } from "../../dist/shared/task-formatting.js";
 
 /**
@@ -163,128 +162,62 @@ describe("Background Task Completion Notification", () => {
     timeoutFired = false;
   });
 
-  it("Run 1: Child completes before timeout - should notify with COMPLETED_OK", async () => {
-    const client = createMockClient();
-    const parentSessionId = "parent_001";
-    const childSessionId = "child_001";
+  it("completes before timeout - should notify with COMPLETED_OK", async () => {
+    const cases = [
+      { parent: "parent_001", child: "child_001", desc: "Quick test task 1" },
+      { parent: "parent_002", child: "child_002", desc: "Quick test task 2" },
+      { parent: "parent_003", child: "child_003", desc: "Quick test task 3" },
+    ];
 
-    registerBackgroundTask(client, {
-      childSessionId,
-      parentSessionId,
-      description: "Quick test task",
-      agentName: "general",
-      timeoutMs: 30000,
-      startedAt: Date.now(),
-      timeoutNotified: false,
-      timeoutHandle: null,
-    });
+    for (const { parent: parentSessionId, child: childSessionId, desc: description } of cases) {
+      // Reset per-iteration state by clearing and re-registering
+      backgroundTasks.clear();
+      notifications = [];
+      timeoutFired = false;
 
-    const completionEvent = {
-      type: "session.idle",
-      properties: {
-        sessionID: childSessionId,
-        status: "idle",
-      },
-    };
+      const client = createMockClient();
 
-    await handleChildLifecycleEvent(client, completionEvent);
+      registerBackgroundTask(client, {
+        childSessionId,
+        parentSessionId,
+        description,
+        agentName: "general",
+        timeoutMs: 30000,
+        startedAt: Date.now(),
+        timeoutNotified: false,
+        timeoutHandle: null,
+      });
 
-    assert.strictEqual(timeoutFired, false, "Timeout should NOT have fired");
-    assert.strictEqual(notifications.length, 1, "Should have exactly 1 notification");
+      const completionEvent = {
+        type: "session.idle",
+        properties: {
+          sessionID: childSessionId,
+          status: "idle",
+        },
+      };
 
-    const notification = notifications[0];
-    assert.strictEqual(notification.to, parentSessionId, "Should notify parent");
-    assert.ok(
-      notification.message.includes("COMPLETED_OK"),
-      `Notification should contain COMPLETED_OK marker. Got: ${notification.message}`
-    );
-    assert.ok(
-      notification.message.includes("Background task completed successfully"),
-      `Notification should say "Background task completed successfully". Got: ${notification.message}`
-    );
-    assert.ok(
-      !notification.message.includes("timed out"),
-      `Notification should NOT say "timed out". Got: ${notification.message}`
-    );
+      await handleChildLifecycleEvent(client, completionEvent);
 
-    console.log("✅ Run 1 PASSED");
-    console.log("   Notification:", notification.message.substring(0, 100) + "...");
-  });
+      assert.strictEqual(timeoutFired, false, `Timeout should NOT have fired [${childSessionId}]`);
+      assert.strictEqual(notifications.length, 1, `Should have exactly 1 notification [${childSessionId}]`);
 
-  it("Run 2: Child completes before timeout - should notify with COMPLETED_OK (repeat)", async () => {
-    const client = createMockClient();
-    const parentSessionId = "parent_002";
-    const childSessionId = "child_002";
+      const notification = notifications[0];
+      assert.strictEqual(notification.to, parentSessionId, `Should notify parent [${childSessionId}]`);
+      assert.ok(
+        notification.message.includes("COMPLETED_OK"),
+        `Notification should contain COMPLETED_OK marker [${childSessionId}]. Got: ${notification.message}`
+      );
+      assert.ok(
+        notification.message.includes("Background task completed successfully"),
+        `Notification should say "Background task completed successfully" [${childSessionId}]. Got: ${notification.message}`
+      );
+      assert.ok(
+        !notification.message.includes("timed out"),
+        `Notification should NOT say "timed out" [${childSessionId}]. Got: ${notification.message}`
+      );
+    }
 
-    registerBackgroundTask(client, {
-      childSessionId,
-      parentSessionId,
-      description: "Quick test task 2",
-      agentName: "general",
-      timeoutMs: 30000,
-      startedAt: Date.now(),
-      timeoutNotified: false,
-      timeoutHandle: null,
-    });
-
-    const completionEvent = {
-      type: "session.idle",
-      properties: {
-        sessionID: childSessionId,
-        status: "idle",
-      },
-    };
-
-    await handleChildLifecycleEvent(client, completionEvent);
-
-    assert.strictEqual(timeoutFired, false, "Timeout should NOT have fired");
-    assert.strictEqual(notifications.length, 1, "Should have exactly 1 notification");
-
-    const notification = notifications[0];
-    assert.ok(
-      notification.message.includes("COMPLETED_OK"),
-      `Notification should contain COMPLETED_OK marker. Got: ${notification.message}`
-    );
-
-    console.log("✅ Run 2 PASSED");
-  });
-
-  it("Run 3: Child completes before timeout - should notify with COMPLETED_OK (repeat)", async () => {
-    const client = createMockClient();
-    const parentSessionId = "parent_003";
-    const childSessionId = "child_003";
-
-    registerBackgroundTask(client, {
-      childSessionId,
-      parentSessionId,
-      description: "Quick test task 3",
-      agentName: "general",
-      timeoutMs: 30000,
-      startedAt: Date.now(),
-      timeoutNotified: false,
-      timeoutHandle: null,
-    });
-
-    const completionEvent = {
-      type: "session.idle",
-      properties: {
-        sessionID: childSessionId,
-        status: "idle",
-      },
-    };
-
-    await handleChildLifecycleEvent(client, completionEvent);
-
-    assert.strictEqual(timeoutFired, false, "Timeout should NOT have fired");
-    assert.strictEqual(notifications.length, 1, "Should have exactly 1 notification");
-
-    const notification = notifications[0];
-    assert.ok(
-      notification.message.includes("COMPLETED_OK"),
-      `Notification should contain COMPLETED_OK marker. Got: ${notification.message}`
-    );
-
-    console.log("✅ Run 3 PASSED");
+    console.log("✅ All 3 completion runs PASSED");
   });
 
   it("Baseline: Timeout fallback still works when no event received", async () => {

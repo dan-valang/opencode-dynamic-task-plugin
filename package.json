@@ -1,0 +1,27 @@
+{
+  "name": "dynamic-task-plugin",
+  "version": "1.0.0",
+  "description": "OpenCode plugin for dynamic subagent task execution",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test src/tests/*.test.js",
+    "lint": "tsc --noEmit",
+    "watch": "tsc --watch"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "subagent",
+    "task"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.14.20"
+  }
+}

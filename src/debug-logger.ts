@@ -6,7 +6,9 @@ const DEFAULT_DEBUG_BLOCKLIST = (process.env.DYNAMIC_TASK_DEBUG_BLOCKLIST ?? "pr
 const MAX_DEBUG_FIELDS = 4;
 
 export function getDebugLogPath(parentSessionId: string, childSessionId: string): string {
-  return path.join(DEBUG_DIR, `parent-${parentSessionId}__child-${childSessionId}.log`);
+  // Sanitize to prevent path traversal via malicious session IDs
+  const sanitize = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "_");
+  return path.join(DEBUG_DIR, `parent-${sanitize(parentSessionId)}__child-${sanitize(childSessionId)}.log`);
 }
 
 export function safeDebugPayload(payload: Record<string, unknown>): Record<string, unknown> {

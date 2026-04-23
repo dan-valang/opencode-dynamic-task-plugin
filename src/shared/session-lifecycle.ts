@@ -10,11 +10,15 @@ export function getSessionIdFromEvent(event: any): string | null {
   const candidates = [
     event?.properties?.sessionID,
     event?.properties?.sessionId,
+    event?.properties?.id,
     event?.data?.sessionID,
     event?.data?.sessionId,
+    event?.data?.id,
     event?.aggregateID,
     event?.sessionID,
     event?.sessionId,
+    event?.subject,
+    event?.resource?.id,
     event?.id,
   ];
 
@@ -33,24 +37,42 @@ export function getEventLifecycleStatus(event: any): string {
   );
 }
 
+const TERMINAL_STATUSES = ["idle", "completed", "error", "deleted"];
+
 export function isTerminalSessionEvent(event: any): boolean {
   const eventType = event?.type;
+  const eventName = event?.name;
   const status = getEventLifecycleStatus(event);
 
-  if (
-    eventType === "sync" &&
-    (event?.name === "session.deleted.1" ||
-      (event?.name === "session.updated.1" &&
-        ["idle", "completed", "error", "deleted"].includes(status)))
-  ) {
+  // Pattern 1: sync events with session.updated/deleted names
+  if (eventType === "sync") {
+    if (eventName === "session.deleted.1" || eventName === "session.deleted") {
+      return true;
+    }
+    if (
+      (eventName === "session.updated.1" || eventName === "session.updated") &&
+      TERMINAL_STATUSES.includes(status)
+    ) {
+      return true;
+    }
+  }
+
+  // Pattern 2: direct event types (session.idle, session.error, etc.)
+  if (TERMINAL_STATUSES.some((s) => eventType === `session.${s}`)) {
     return true;
   }
 
-  if (["session.idle", "session.error", "session.deleted"].includes(eventType)) {
+  // Pattern 3: session.status events with terminal status payload
+  if (eventType === "session.status" && TERMINAL_STATUSES.includes(status)) {
     return true;
   }
 
-  return eventType === "session.status" && ["idle", "completed", "error", "deleted"].includes(status);
+  // Pattern 4: any event with a terminal status in properties (broad catch-all)
+  if (status && TERMINAL_STATUSES.includes(status) && getSessionIdFromEvent(event)) {
+    return true;
+  }
+
+  return false;
 }
 
 const raw = process.env.DYNAMIC_TASK_MAX_CONCURRENT;

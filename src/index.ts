@@ -42,7 +42,6 @@ let lastCacheTime = 0;
 const CACHE_TTL = parseInt(process.env.DYNAMIC_TASK_CACHE_TTL || "300000", 10);
 const POLL_INTERVAL = 3000;
 const DEFAULT_WAIT_MS = parseInt(process.env.DYNAMIC_TASK_TIMEOUT || "120000", 10);
-const NOTIFY_MAX_TEXT = 1200;
 const backgroundTasks = new Map<string, BackgroundTaskState>();
 
 function resolveParentSessionId(ctx: any): string | null {
@@ -107,13 +106,12 @@ function getLatestAssistantText(messages: any[], startIndex: number = 0): string
   return "";
 }
 
-function truncateText(text: string, maxChars: number = NOTIFY_MAX_TEXT): string {
+function truncateText(text: string, maxChars: number = 1200): string {
   if (text.length <= maxChars) return text;
   return `${text.slice(0, maxChars)}...`;
 }
 
-
-
+// unused, kept for compatibility with any external callers
 async function readSessionMessages(client: any, sessionId: string): Promise<any[]> {
   const messagesResult = await client.session.messages({ path: { id: sessionId } });
   return extractMessages(messagesResult);
@@ -325,7 +323,28 @@ export default async function dynamicTaskPlugin({
 
   return {
     event: async ({ event }: any) => {
-      await handleChildLifecycleEvent(client, event);
+      // Diagnostic: log every event to help diagnose event handler issues
+      debugLog("event-handler", "event-handler", "event-received", {
+        type: event?.type,
+        name: event?.name,
+        sessionId: getSessionIdFromEvent(event),
+        status: getEventLifecycleStatus(event),
+      });
+
+      try {
+        await handleChildLifecycleEvent(client, event);
+      } catch (e: any) {
+        debugLog("event-handler", "event-handler", "event-handler-error", {
+          error: e?.message,
+        });
+        await client.app.log({
+          body: {
+            service: "dynamic-task",
+            level: "warn",
+            message: `Event handler error: ${e?.message}`,
+          },
+        });
+      }
     },
 
     tool: {
@@ -497,6 +516,22 @@ export default async function dynamicTaskPlugin({
             const messages = await readSessionMessages(client, args.session_id);
             const latest = getLatestAssistantText(messages, 0) || "(No assistant text found)";
             const tracked = backgroundTasks.get(args.session_id);
+
+            // Safety net: if session is done but background task still has a pending timeout,
+            // cancel the timeout and clean up. This catches cases where the event handler
+            // missed the completion event.
+            if (tracked && !tracked.timeoutNotified && ["idle", "completed", "error"].includes(status)) {
+              if (tracked.timeoutHandle) {
+                clearTimeout(tracked.timeoutHandle);
+                tracked.timeoutHandle = null;
+              }
+              tracked.timeoutNotified = false; // completed, not timed out
+              debugLog(tracked.parentSessionId, args.session_id, "safety-net-cleanup", {
+                status,
+                source: "task_result",
+              });
+              backgroundTasks.delete(args.session_id);
+            }
 
             return formatTaskResultSummary({
               sessionId: args.session_id,
