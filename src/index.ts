@@ -92,6 +92,8 @@ function extractSessionStatus(sessionInfo: any): string {
     sessionInfo?.data?.info?.status,
     sessionInfo?.info?.status,
     sessionInfo?.body?.info?.status,
+    sessionInfo?.data?.state,
+    sessionInfo?.state,
   ];
   for (const c of candidates) {
     const normalized = normalizeStatus(c);
@@ -99,7 +101,7 @@ function extractSessionStatus(sessionInfo: any): string {
   }
   // Log full response shape when status can't be determined — helps debug API shape
   if (sessionInfo) {
-    const shape = JSON.stringify(sessionInfo, null, 2).slice(0, 500);
+    const shape = JSON.stringify(sessionInfo, null, 2).slice(0, 1000);
     debugLog("status-debug", "status-debug", "unknown-status-shape", { shape });
   }
   return "unknown";
@@ -608,7 +610,7 @@ export default async function dynamicTaskPlugin({
               latestText: latest,
               tracked: Boolean(tracked),
               timeoutNotified: Boolean(tracked?.timeoutNotified),
-              debugShape: status === "unknown" ? JSON.stringify(sessionInfo).slice(0, 300) : undefined,
+              debugShape: status === "unknown" ? JSON.stringify(sessionInfo).slice(0, 1000) : undefined,
             });
           } catch (error: any) {
             if (error.message?.includes("not found")) {
