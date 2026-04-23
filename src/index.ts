@@ -84,7 +84,7 @@ function extractTextFromParts(parts: any[]): string {
     .join("\n");
 }
 
-function extractSessionStatus(sessionInfo: any): string {
+function extractSessionStatus(sessionInfo: any, messages: any[] = []): string {
   const candidates = [
     sessionInfo?.status,
     sessionInfo?.body?.status,
@@ -99,11 +99,16 @@ function extractSessionStatus(sessionInfo: any): string {
     const normalized = normalizeStatus(c);
     if (normalized) return normalized;
   }
-  // Log full response shape when status can't be determined — helps debug API shape
-  if (sessionInfo) {
-    const shape = JSON.stringify(sessionInfo, null, 2).slice(0, 1000);
-    debugLog("status-debug", "status-debug", "unknown-status-shape", { shape });
+
+  // client.session.get() does not return a status field — infer from messages
+  if (messages.length >= 2) {
+    const latest = messages[messages.length - 1];
+    const role = latest?.info?.role || latest?.role;
+    if (role === "assistant") return "completed";
+    if (role === "error") return "error";
   }
+  if (messages.length > 0) return "busy";
+
   return "unknown";
 }
 
@@ -202,7 +207,7 @@ async function pollForResponse(
       if (latest.trim()) return latest;
 
       const sessionInfo = await client.session.get({ path: { id: sessionId } });
-      const status = extractSessionStatus(sessionInfo);
+      const status = extractSessionStatus(sessionInfo, messages);
 
       if (status === "idle" || status === "completed" || status === "error") {
         const finalMessages = await readSessionMessages(client, sessionId);
@@ -553,7 +558,8 @@ export default async function dynamicTaskPlugin({
 
           try {
             const sessionInfo = await client.session.get({ path: { id: args.session_id } });
-            const status = extractSessionStatus(sessionInfo);
+            const messages = await readSessionMessages(client, args.session_id);
+            const status = extractSessionStatus(sessionInfo, messages);
 
             // Always-on diagnostic: log raw sessionInfo structure
             const infoKeys = sessionInfo ? Object.keys(sessionInfo).slice(0, 8).join(",") : "(null)";
@@ -565,7 +571,6 @@ export default async function dynamicTaskPlugin({
                 message: `task_result: sid=${args.session_id} status=${status} info.keys=[${infoKeys}] body.keys=[${bodyKeys}] raw.status=${JSON.stringify(sessionInfo?.status)} raw.body.status=${JSON.stringify(sessionInfo?.body?.status)}`,
               },
             });
-            const messages = await readSessionMessages(client, args.session_id);
             const latest = getLatestAssistantText(messages, 0) || "(No assistant text found)";
             const tracked = backgroundTasks.get(args.session_id);
 
