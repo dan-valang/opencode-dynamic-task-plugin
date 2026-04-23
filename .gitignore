@@ -1,5 +1,6 @@
 # Debug logs
 .dynamic-task-logs/
+.worktree/
 
 # Build output
 dist/
