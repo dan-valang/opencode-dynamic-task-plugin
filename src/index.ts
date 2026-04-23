@@ -608,6 +608,7 @@ export default async function dynamicTaskPlugin({
               latestText: latest,
               tracked: Boolean(tracked),
               timeoutNotified: Boolean(tracked?.timeoutNotified),
+              debugShape: status === "unknown" ? JSON.stringify(sessionInfo).slice(0, 300) : undefined,
             });
           } catch (error: any) {
             if (error.message?.includes("not found")) {

@@ -70,6 +70,7 @@ export function formatTaskResultSummary(input: {
   latestText: string;
   tracked: boolean;
   timeoutNotified: boolean;
+  debugShape?: string;
 }): string {
   const action =
     input.status === "busy"
@@ -78,7 +79,7 @@ export function formatTaskResultSummary(input: {
         ? "Recommended next action: inspect latest output, then use task_continue if recovery is possible."
         : "Recommended next action: no follow-up needed unless you want to continue the child session.";
 
-  return [
+  const lines = [
     "## Task Result",
     "",
     `Session: ${input.sessionId}`,
@@ -91,5 +92,11 @@ export function formatTaskResultSummary(input: {
     input.latestText || "(No assistant text found)",
     "",
     action,
-  ].join("\n");
+  ];
+
+  if (input.debugShape) {
+    lines.push("", "### Debug: Raw Session Response Shape", "```", input.debugShape, "```");
+  }
+
+  return lines.join("\n");
 }
