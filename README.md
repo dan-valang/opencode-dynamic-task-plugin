@@ -150,10 +150,10 @@ DYNAMIC_TASK_DEBUG=1 npm test
 
 ```bash
 npm run lint      # TypeScript type check
-npm test          # Full test suite (66 tests, sequential)
+npm test          # Full test suite (130 tests, sequential)
 ```
 
-Expected: lint passes, all 60 tests pass.
+Expected: lint passes, all 114 tests pass.
 
 ## License
 
