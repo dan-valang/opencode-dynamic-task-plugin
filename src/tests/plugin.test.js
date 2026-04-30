@@ -503,3 +503,553 @@ describe("getDebugLogPath", () => {
     assert.match(logPath, /parent-parent_1__child-child_2\.log$/);
   });
 });
+
+describe("safeDebugPayload fallback parsing", () => {
+  it("handles null/undefined payloads", () => {
+    assert.deepStrictEqual(safeDebugPayload(null), {});
+    assert.deepStrictEqual(safeDebugPayload(undefined), {});
+  });
+});
+
+// --- Task ID validation and persistence (Task 1) ---
+import {
+  validateTaskId,
+  loadTaskIdMap,
+  saveTaskIdMap,
+} from "../../dist/shared/session-lifecycle.js";
+
+import { unlinkSync, writeFileSync, existsSync } from "node:fs";
+
+const TEST_MAP_PATH = ".dynamic-task-ids.json";
+
+describe("validateTaskId", () => {
+  it("accepts valid task IDs", () => {
+    assert.strictEqual(validateTaskId("task_123"), true);
+    assert.strictEqual(validateTaskId("my-task"), true);
+    assert.strictEqual(validateTaskId("TaskName01"), true);
+  });
+
+  it("rejects invalid task IDs", () => {
+    assert.strictEqual(validateTaskId(""), false);
+    assert.strictEqual(validateTaskId("task!@#"), false);
+    assert.strictEqual(validateTaskId("a".repeat(65)), false);
+    assert.strictEqual(validateTaskId(null), false);
+    assert.strictEqual(validateTaskId(undefined), false);
+  });
+});
+
+describe("taskId persistence", () => {
+  beforeEach(() => {
+    // Clean up test file before each test
+    if (existsSync(TEST_MAP_PATH)) unlinkSync(TEST_MAP_PATH);
+  });
+
+  it("loads and saves task ID mappings", () => {
+    const map = new Map([["task1", "ses_1"], ["task2", "ses_2"]]);
+    saveTaskIdMap(map);
+    const loaded = loadTaskIdMap();
+    assert.strictEqual(loaded.get("task1"), "ses_1");
+    assert.strictEqual(loaded.get("task2"), "ses_2");
+  });
+
+  it("handles empty map", () => {
+    saveTaskIdMap(new Map());
+    const loaded = loadTaskIdMap();
+    assert.strictEqual(loaded.size, 0);
+  });
+
+  it("ignores invalid entries on load", () => {
+    saveTaskIdMap(new Map([["valid_id", "ses_1"]]));
+    // Manually corrupt the file to add an invalid entry
+    writeFileSync(TEST_MAP_PATH, JSON.stringify({ "valid_id": "ses_1", "": "ses_2", "bad!@#": "ses_3" }));
+    const loaded = loadTaskIdMap();
+    assert.strictEqual(loaded.get("valid_id"), "ses_1");
+    assert.strictEqual(loaded.size, 1, "Invalid entries must be filtered out");
+  });
+});
+
+// ============================================================
+// === Task 0 Step 1: Config Normalization Tests ===
+// Expected: FAIL because src/shared/config.ts does not exist yet
+// ============================================================
+
+import {
+  normalizeDynamicTaskConfig,
+  resolveTimeoutMs,
+  parseDynamicTaskJsonc,
+} from "../../dist/shared/config.js";
+
+describe("normalizeDynamicTaskConfig", () => {
+  it("returns safe defaults when given empty options", () => {
+    const config = normalizeDynamicTaskConfig({});
+    assert.strictEqual(config.defaultTimeoutMs, 120000);
+    assert.strictEqual(config.maxTimeoutMs, 3600000);
+    assert.strictEqual(config.minTimeoutMs, 1000);
+    assert.strictEqual(config.maxDepth, 2);
+    assert.strictEqual(config.maxConcurrent, 4);
+    assert.deepStrictEqual(config.blockedAgents, ["general"]);
+    assert.strictEqual(config.allowSameAgentRecursion, false);
+    assert.strictEqual(config.defaultAwaitResponse, false);
+    assert.strictEqual(config.timeoutBehavior, "interrupt");
+  });
+
+  it("returns safe defaults when given null/undefined options", () => {
+    const configNull = normalizeDynamicTaskConfig(null);
+    assert.strictEqual(configNull.defaultTimeoutMs, 120000);
+    const configUndef = normalizeDynamicTaskConfig(undefined);
+    assert.strictEqual(configUndef.defaultTimeoutMs, 120000);
+  });
+
+  it("respects plugin tuple options overriding defaults", () => {
+    const config = normalizeDynamicTaskConfig({
+      defaultTimeoutMs: 60000,
+      maxConcurrent: 8,
+      blockedAgents: ["general", "coder"],
+      timeoutBehavior: "notify",
+    });
+    assert.strictEqual(config.defaultTimeoutMs, 60000);
+    assert.strictEqual(config.maxConcurrent, 8);
+    assert.deepStrictEqual(config.blockedAgents, ["general", "coder"]);
+    assert.strictEqual(config.timeoutBehavior, "notify");
+  });
+
+  it("respects env vars overriding file config", () => {
+    const originalTimeout = process.env.DYNAMIC_TASK_TIMEOUT;
+    process.env.DYNAMIC_TASK_TIMEOUT = "300000";
+    try {
+      // Pass file config as second arg (fileConfig), env should override
+      const config = normalizeDynamicTaskConfig({}, {
+        defaultTimeoutMs: 120000, // from "file"
+      });
+      assert.strictEqual(config.defaultTimeoutMs, 300000); // env wins over file
+    } finally {
+      if (originalTimeout !== undefined) {
+        process.env.DYNAMIC_TASK_TIMEOUT = originalTimeout;
+      } else {
+        delete process.env.DYNAMIC_TASK_TIMEOUT;
+      }
+    }
+  });
+
+  it("treats empty-string env var as 'not set' — falls through to next level", () => {
+    const originalTimeout = process.env.DYNAMIC_TASK_TIMEOUT;
+    process.env.DYNAMIC_TASK_TIMEOUT = "";
+    try {
+      const config = normalizeDynamicTaskConfig({
+        defaultTimeoutMs: 45000, // from "file"
+      });
+      // empty env string must fall through to file value, not default
+      assert.strictEqual(config.defaultTimeoutMs, 45000);
+    } finally {
+      if (originalTimeout !== undefined) {
+        process.env.DYNAMIC_TASK_TIMEOUT = originalTimeout;
+      } else {
+        delete process.env.DYNAMIC_TASK_TIMEOUT;
+      }
+    }
+  });
+
+  it("empty env forbidden agents does NOT unblock general", () => {
+    const original = process.env.DYNAMIC_TASK_FORBIDDEN_AGENTS;
+    process.env.DYNAMIC_TASK_FORBIDDEN_AGENTS = "";
+    try {
+      const config = normalizeDynamicTaskConfig({});
+      // general must STAY blocked — empty env is treated as 'not set'
+      assert.ok(config.blockedAgents.includes("general"));
+    } finally {
+      if (original !== undefined) {
+        process.env.DYNAMIC_TASK_FORBIDDEN_AGENTS = original;
+      } else {
+        delete process.env.DYNAMIC_TASK_FORBIDDEN_AGENTS;
+      }
+    }
+  });
+
+  it("explicit env forbidden agents overrides blockedAgents", () => {
+    const original = process.env.DYNAMIC_TASK_FORBIDDEN_AGENTS;
+    process.env.DYNAMIC_TASK_FORBIDDEN_AGENTS = "coder,reviewer";
+    try {
+      const config = normalizeDynamicTaskConfig({});
+      assert.deepStrictEqual(config.blockedAgents, ["coder", "reviewer"]);
+    } finally {
+      if (original !== undefined) {
+        process.env.DYNAMIC_TASK_FORBIDDEN_AGENTS = original;
+      } else {
+        delete process.env.DYNAMIC_TASK_FORBIDDEN_AGENTS;
+      }
+    }
+  });
+
+  it("does not read custom root-level opencode.jsonc keys", () => {
+    // The function signature accepts plugin options, not opencode.jsonc root keys.
+    // Custom root keys are never passed to the plugin — this is enforced at the
+    // OpenCode schema level (additionalProperties: false).
+    // Test that the function gracefully handles unknown config shapes.
+    const config = normalizeDynamicTaskConfig({ unknownField: "should be ignored" });
+    assert.strictEqual(config.defaultTimeoutMs, 120000, "Unknown fields must not corrupt defaults");
+  });
+});
+
+describe("resolveTimeoutMs", () => {
+  it("returns the value when within bounds", () => {
+    const config = normalizeDynamicTaskConfig({});
+    const resolved = resolveTimeoutMs(30000, config);
+    assert.strictEqual(resolved, 30000);
+  });
+
+  it("clamps to minTimeoutMs when value is too low", () => {
+    const config = normalizeDynamicTaskConfig({});
+    const resolved = resolveTimeoutMs(500, config);
+    assert.strictEqual(resolved, 1000); // clamped to minTimeoutMs
+  });
+
+  it("clamps to maxTimeoutMs when value is too high", () => {
+    const config = normalizeDynamicTaskConfig({});
+    const resolved = resolveTimeoutMs(9999999, config);
+    assert.strictEqual(resolved, 3600000); // clamped to maxTimeoutMs
+  });
+
+  it("falls back to defaultTimeoutMs for invalid values", () => {
+    const config = normalizeDynamicTaskConfig({ defaultTimeoutMs: 120000 });
+    assert.strictEqual(resolveTimeoutMs(NaN, config), 120000, "NaN → default");
+    assert.strictEqual(resolveTimeoutMs(0, config), 120000, "0 → default");
+    assert.strictEqual(resolveTimeoutMs(-1, config), 120000, "-1 → default");
+    assert.strictEqual(resolveTimeoutMs(Infinity, config), 120000, "Infinity → default");
+    assert.strictEqual(resolveTimeoutMs(-Infinity, config), 120000, "-Infinity → default");
+    assert.strictEqual(resolveTimeoutMs("30s", config), 120000, "non-numeric string → default");
+    assert.strictEqual(resolveTimeoutMs(null, config), 120000, "null → default");
+    assert.strictEqual(resolveTimeoutMs(undefined, config), 120000, "undefined → default");
+    assert.strictEqual(resolveTimeoutMs(0.5, config), 120000, "float < 1 → default");
+  });
+
+  it("handles minTimeoutMs > maxTimeoutMs inversion gracefully", () => {
+    const config = normalizeDynamicTaskConfig({
+      minTimeoutMs: 5000,
+      maxTimeoutMs: 1000, // inverted
+    });
+    // Must not NaN or throw; use min(max,min) for safe bounds
+    const resolved = resolveTimeoutMs(2000, config);
+    assert.ok(Number.isFinite(resolved), "Must return finite number");
+    assert.ok(resolved >= 1000 && resolved <= 5000,
+      `Expected ${resolved} to be within [1000, 5000]`);
+  });
+});
+
+describe("parseDynamicTaskJsonc", () => {
+  // Expected initial result: FAIL because parseDynamicTaskJsonc does not exist
+  it("exists as an exported function", () => {
+    assert.strictEqual(typeof parseDynamicTaskJsonc, "function");
+  });
+});
+
+// ============================================================
+// === Task 0 Step 3: Policy Tests ===
+// Expected: FAIL because src/shared/task-policy.ts does not exist
+// ============================================================
+
+import {
+  normalizeAgentName,
+  validateAgent,
+  isSameAgent,
+  validateLineage,
+  buildTaskLineage,
+  resolveAwaitResponse,
+} from "../../dist/shared/task-policy.js";
+
+describe("normalizeAgentName", () => {
+  // type PolicyResult is type-only, imported via the functions' return types
+  it("lowercases and trims agent names", () => {
+    assert.strictEqual(normalizeAgentName("General"), "general");
+    assert.strictEqual(normalizeAgentName("  REVIEWER "), "reviewer");
+  });
+
+  it("strips @ prefix", () => {
+    assert.strictEqual(normalizeAgentName("@general"), "general");
+    assert.strictEqual(normalizeAgentName("@Reviewer"), "reviewer");
+  });
+
+  it("returns null for unsupported types", () => {
+    assert.strictEqual(normalizeAgentName(null), null);
+    assert.strictEqual(normalizeAgentName(undefined), null);
+    assert.strictEqual(normalizeAgentName(123), null);
+    assert.strictEqual(normalizeAgentName(""), null);
+  });
+});
+
+describe("validateAgent", () => {
+  const config = normalizeDynamicTaskConfig({});
+
+  it("rejects 'general' by default", () => {
+    const result = validateAgent("general", config);
+    assert.strictEqual(result.ok, false);
+    if (!result.ok) assert.match(result.error, /general/i);
+  });
+
+  it("rejects @General (normalized)", () => {
+    const result = validateAgent("@General", config);
+    assert.strictEqual(result.ok, false);
+  });
+
+  it("allows non-blocked agents", () => {
+    const result = validateAgent("reviewer", config);
+    assert.strictEqual(result.ok, true);
+  });
+
+  it("allows agents not in blockedAgents", () => {
+    const customConfig = normalizeDynamicTaskConfig({ blockedAgents: ["coder"] });
+    assert.strictEqual(validateAgent("reviewer", customConfig).ok, true);
+    assert.strictEqual(validateAgent("coder", customConfig).ok, false);
+    assert.strictEqual(validateAgent("general", customConfig).ok, true); // general is NOT blocked here
+  });
+});
+
+describe("isSameAgent", () => {
+  it("detects same agent ignoring @ prefix and case", () => {
+    assert.strictEqual(isSameAgent("reviewer", "reviewer"), true);
+    assert.strictEqual(isSameAgent("Reviewer", "reviewer"), true);
+    assert.strictEqual(isSameAgent("@reviewer", "reviewer"), true);
+    assert.strictEqual(isSameAgent("@Reviewer", "reviewer"), true);
+  });
+
+  it("rejects different agents", () => {
+    assert.strictEqual(isSameAgent("reviewer", "coder"), false);
+    assert.strictEqual(isSameAgent("explore", "general"), false);
+  });
+});
+
+describe("validateLineage", () => {
+  const config = normalizeDynamicTaskConfig({ maxDepth: 2 });
+
+  it("rejects same-agent anywhere in lineage", () => {
+    const result = validateLineage(["reviewer"], "reviewer", config);
+    assert.strictEqual(result.ok, false);
+    if (!result.ok) assert.match(result.error, /recursion|same-agent|already present/i);
+  });
+
+  it("rejects same-agent deep in lineage", () => {
+    const result = validateLineage(["general", "coder", "explore"], "general", config);
+    assert.strictEqual(result.ok, false);
+  });
+
+  it("rejects when next depth exceeds maxDepth", () => {
+    const result = validateLineage(["general", "coder"], "explore", config);
+    assert.strictEqual(result.ok, false);
+    if (!result.ok) assert.match(result.error, /depth/i);
+  });
+
+  it("allows different-agent chain within depth limit", () => {
+    const result = validateLineage(["general"], "coder", config);
+    assert.strictEqual(result.ok, true);
+  });
+
+  it("does not mutate lineage arrays", () => {
+    const lineage = ["general", "coder"];
+    const copy = [...lineage];
+    validateLineage(lineage, "explore", config); // should fail — exceeds depth
+    assert.deepStrictEqual(lineage, copy, "Lineage must not be mutated");
+  });
+});
+
+describe("buildTaskLineage", () => {
+  it("appends child agent to parent lineage", () => {
+    const result = buildTaskLineage(["general", "coder"], "explore");
+    assert.deepStrictEqual(result, ["general", "coder", "explore"]);
+  });
+
+  it("handles empty parent lineage", () => {
+    const result = buildTaskLineage([], "reviewer");
+    assert.deepStrictEqual(result, ["reviewer"]);
+  });
+});
+
+describe("resolveAwaitResponse", () => {
+  const config = normalizeDynamicTaskConfig({ defaultAwaitResponse: false });
+
+  it("defaults to config.defaultAwaitResponse when arg is undefined", () => {
+    assert.strictEqual(resolveAwaitResponse(undefined, config), false);
+    assert.strictEqual(resolveAwaitResponse(null, config), false);
+  });
+
+  it("return true for explicit true", () => {
+    assert.strictEqual(resolveAwaitResponse(true, config), true);
+  });
+
+  it("return false for explicit false", () => {
+    assert.strictEqual(resolveAwaitResponse(false, config), false);
+  });
+
+  it("honors config.defaultAwaitResponse when set to true", () => {
+    const syncConfig = normalizeDynamicTaskConfig({ defaultAwaitResponse: true });
+    assert.strictEqual(resolveAwaitResponse(undefined, syncConfig), true);
+  });
+});
+
+// ============================================================
+// === Task 0 Step 5: State Tests ===
+// Expected: FAIL because src/shared/task-state.ts does not exist
+// ============================================================
+
+import {
+  createStateStore,
+  registerActiveTask,
+  transitionState,
+  findTask,
+} from "../../dist/shared/task-state.js";
+import { checkConcurrencyLimit } from "../../dist/shared/config.js";
+
+describe("task-state: createStateStore", () => {
+  it("creates empty active and retained maps", () => {
+    const store = createStateStore();
+    assert.strictEqual(store.activeTasks.size, 0);
+    assert.strictEqual(store.retainedTasks.size, 0);
+  });
+});
+
+describe("task-state: registerActiveTask", () => {
+  const config = normalizeDynamicTaskConfig({ maxConcurrent: 3 });
+
+  it("increments active count when registering", () => {
+    const store = createStateStore();
+    const task = registerActiveTask(store, {
+      childSessionId: "ses_1",
+      parentSessionId: "parent_1",
+      agentName: "reviewer",
+      description: "test task",
+      lineage: ["explore"],
+      isBackground: true,  // counts toward concurrency
+    }, config);
+    assert.ok(task, "Should return the task state");
+    assert.strictEqual(store.activeTasks.size, 1);
+  });
+
+  it("throws ConcurrencyLimitExceededError when at limit (background tasks only)", () => {
+    const store = createStateStore();
+    // Fill up with 3 background tasks
+    registerActiveTask(store, {
+      childSessionId: "ses_1", parentSessionId: "parent_1",
+      agentName: "a1", description: "t1", lineage: [], isBackground: true,
+    }, config);
+    registerActiveTask(store, {
+      childSessionId: "ses_2", parentSessionId: "parent_1",
+      agentName: "a2", description: "t2", lineage: [], isBackground: true,
+    }, config);
+    registerActiveTask(store, {
+      childSessionId: "ses_3", parentSessionId: "parent_1",
+      agentName: "a3", description: "t3", lineage: [], isBackground: true,
+    }, config);
+
+    // 4th background task should throw
+    assert.throws(() => {
+      registerActiveTask(store, {
+        childSessionId: "ses_4", parentSessionId: "parent_1",
+        agentName: "a4", description: "t4", lineage: [], isBackground: true,
+      }, config);
+    }, /Concurrency|concurrency|exceeded/);
+  });
+
+  it("sync tasks (isBackground=false) do NOT count toward concurrency limit", () => {
+    const store = createStateStore();
+    // Fill to limit with background
+    registerActiveTask(store, {
+      childSessionId: "ses_1", parentSessionId: "parent_1",
+      agentName: "a1", description: "t1", lineage: [], isBackground: true,
+    }, config);
+    registerActiveTask(store, {
+      childSessionId: "ses_2", parentSessionId: "parent_1",
+      agentName: "a2", description: "t2", lineage: [], isBackground: true,
+    }, config);
+    registerActiveTask(store, {
+      childSessionId: "ses_3", parentSessionId: "parent_1",
+      agentName: "a3", description: "t3", lineage: [], isBackground: true,
+    }, config);
+
+    // Sync task should succeed even though at background limit
+    const syncTask = registerActiveTask(store, {
+      childSessionId: "ses_sync", parentSessionId: "parent_1",
+      agentName: "sync", description: "sync task", lineage: [], isBackground: false,
+    }, config);
+    assert.ok(syncTask);
+    assert.strictEqual(store.activeTasks.size, 4); // 3 bg + 1 sync
+  });
+});
+
+describe("task-state: transitionState", () => {
+  const config = normalizeDynamicTaskConfig({});
+  let store;
+
+  beforeEach(() => {
+    store = createStateStore();
+    registerActiveTask(store, {
+      childSessionId: "ses_active", parentSessionId: "parent_1",
+      agentName: "reviewer", description: "test", lineage: [], isBackground: true,
+    }, config);
+  });
+
+  it("transitions active → completed", () => {
+    const result = transitionState(store, "ses_active", "completed", config);
+    assert.strictEqual(result.state, "completed");
+    assert.strictEqual(store.activeTasks.has("ses_active"), false);
+  });
+
+  it("transitions active → timeout_interrupting → timed_out_retained", () => {
+    transitionState(store, "ses_active", "timeout_interrupting", config);
+    const result = transitionState(store, "ses_active", "timed_out_retained", config);
+    assert.strictEqual(result.state, "timed_out_retained");
+    assert.strictEqual(store.activeTasks.has("ses_active"), false);
+    assert.strictEqual(store.retainedTasks.has("ses_active"), true);
+  });
+
+  it("transitions active → error", () => {
+    const result = transitionState(store, "ses_active", "error", config);
+    assert.strictEqual(result.state, "error");
+    assert.strictEqual(store.activeTasks.has("ses_active"), false);
+  });
+
+  it("idempotent: same transition twice throws on terminal state", () => {
+    transitionState(store, "ses_active", "completed", config);
+    // A second transition from completed (terminal state) must throw
+    assert.throws(() => {
+      transitionState(store, "ses_active", "completed", config);
+    }, /terminal|invalid|transition/i);
+  });
+
+  it("rejects invalid transition (completed → active)", () => {
+    transitionState(store, "ses_active", "completed", config);
+    assert.throws(() => {
+      transitionState(store, "ses_active", "active", config);
+    }, /invalid|transition/i);
+  });
+
+  it("retained task remains visible to findTask", () => {
+    transitionState(store, "ses_active", "timed_out_retained", config);
+    const found = findTask(store, "ses_active");
+    assert.ok(found, "Retained task must be findable");
+    assert.strictEqual(found?.state, "timed_out_retained");
+  });
+
+  it("unknown session ID transition throws", () => {
+    assert.throws(() => {
+      transitionState(store, "nonexistent", "completed", config);
+    }, /not found|unknown/i);
+  });
+});
+
+describe("task-state: concurrency helper", () => {
+  const config = normalizeDynamicTaskConfig({ maxConcurrent: 2 });
+
+  it("returns null when under limit", () => {
+    const result = checkConcurrencyLimit(1, config);
+    assert.strictEqual(result, null);
+  });
+
+  it("returns error message when at limit", () => {
+    const result = checkConcurrencyLimit(2, config);
+    assert.ok(result.includes("Cannot register"));
+    assert.ok(result.includes("2"));
+  });
+
+  it("returns error message when over limit", () => {
+    const result = checkConcurrencyLimit(3, config);
+    assert.ok(result);
+  });
+});

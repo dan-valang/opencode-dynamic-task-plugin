@@ -8,7 +8,6 @@ import {
   getSessionIdFromEvent,
   getEventLifecycleStatus,
   isTerminalSessionEvent,
-  MAX_CONCURRENT_TASKS,
 } from "./shared/session-lifecycle.js";
 import {
   buildBackgroundPrompt,
@@ -16,34 +15,81 @@ import {
   formatTaskResultSummary,
 } from "./shared/task-formatting.js";
 import { debugLog } from "./debug-logger.js";
+import {
+  getRequestIdFromQuestion,
+  normalizeQuestionAnswers,
+  replyToQuestion,
+  rejectQuestion,
+} from "./shared/question-handling.js";
+import {
+  normalizeDynamicTaskConfig,
+  resolveTimeoutMs,
+  parseDynamicTaskJsonc,
+  checkConcurrencyLimit,
+  type DynamicTaskConfig,
+} from "./shared/config.js";
+import {
+  normalizeAgentName,
+  validateAgent,
+  validateLineage,
+  buildTaskLineage,
+  resolveAwaitResponse,
+} from "./shared/task-policy.js";
+import {
+  createStateStore,
+  registerActiveTask,
+  transitionState,
+  findTask,
+  pruneRetainedTasks,
+  type TaskStore,
+  type ActiveTaskState,
+  type RetainedTaskState,
+} from "./shared/task-state.js";
 
-interface Agent {
-  name: string;
-  description?: string;
-  mode?: string;
-  type?: string;
-  [key: string]: any;
-}
-
-interface BackgroundTaskState {
-  childSessionId: string;
-  parentSessionId: string;
-  description: string;
-  agentName: string;
-  timeoutMs: number;
-  startedAt: number;
-  timeoutNotified: boolean;
-  completed: boolean;
-  timeoutHandle: ReturnType<typeof setTimeout> | null;
-}
-
-let cachedAgents: Agent[] = [];
+let cachedAgents: any[] = [];
 let lastCacheTime = 0;
 
-const CACHE_TTL = parseInt(process.env.DYNAMIC_TASK_CACHE_TTL || "300000", 10);
+const CACHE_TTL = 300000;
 const POLL_INTERVAL = 3000;
-const DEFAULT_WAIT_MS = parseInt(process.env.DYNAMIC_TASK_TIMEOUT || "120000", 10);
-const backgroundTasks = new Map<string, BackgroundTaskState>();
+
+// Plugin-level state store (ephemeral — lost on restart)
+interface PluginState {
+  store: TaskStore;
+  config: DynamicTaskConfig;
+  deprecationWarned: boolean;
+  pendingSyncRequests: Map<string, {
+    resolve: (result: any) => void;
+    reject: (error: Error) => void;
+    timeoutHandle: ReturnType<typeof setTimeout>;
+  }>;
+}
+
+let pluginState: PluginState | null = null;
+
+// Persisted task-to-session mapping for crash recovery
+import { loadTaskIdMap, saveTaskIdMap, validateTaskId } from "./shared/session-lifecycle.js";
+
+const taskIdToSessionId: Map<string, string> = new Map();
+// Runtime question-to-session mapping (not persisted, populated from events)
+const questionIdToSessionId: Map<string, string> = new Map();
+
+function initPluginState(directory: string, options: any): PluginState {
+  // Load dedicated config file if it exists
+  const configPath = directory
+    ? `${directory}/.opencode/dynamic-task-plugin.jsonc`
+    : null;
+  const fileConfig = configPath ? parseDynamicTaskJsonc(configPath) : null;
+
+  const config = normalizeDynamicTaskConfig(options, fileConfig as any);
+  const store = createStateStore();
+
+  return {
+    store,
+    config,
+    deprecationWarned: false,
+    pendingSyncRequests: new Map(),
+  };
+}
 
 function resolveParentSessionId(ctx: any): string | null {
   const candidates = [
@@ -71,9 +117,9 @@ function validateSessionResult(result: any): string | null {
   return null;
 }
 
-function buildAgentList(agents: Agent[]): string {
+function buildAgentList(agents: any[]): string {
   if (agents.length === 0) return "(none discovered)";
-  return agents.map((a) => a.name).join(", ");
+  return agents.map((a: any) => a.name).join(", ");
 }
 
 function extractTextFromParts(parts: any[]): string {
@@ -135,12 +181,6 @@ function getLatestAssistantText(messages: any[], startIndex: number = 0): string
   return "";
 }
 
-function truncateText(text: string, maxChars: number = 1200): string {
-  if (text.length <= maxChars) return text;
-  return `${text.slice(0, maxChars)}...`;
-}
-
-// unused, kept for compatibility with any external callers
 async function readSessionMessages(client: any, sessionId: string): Promise<any[]> {
   const messagesResult = await client.session.messages({ path: { id: sessionId } });
   return extractMessages(messagesResult);
@@ -155,7 +195,7 @@ async function getMessageCount(client: any, sessionId: string): Promise<number> 
   }
 }
 
-async function fetchAgents(client: any): Promise<Agent[]> {
+async function fetchAgents(client: any): Promise<any[]> {
   const now = Date.now();
   if (now - lastCacheTime < CACHE_TTL && cachedAgents.length > 0) {
     return cachedAgents;
@@ -163,7 +203,7 @@ async function fetchAgents(client: any): Promise<Agent[]> {
 
   try {
     const result = await client.app.agents();
-    let agents: Agent[] = [];
+    let agents: any[] = [];
 
     if (Array.isArray(result)) {
       agents = result;
@@ -171,7 +211,7 @@ async function fetchAgents(client: any): Promise<Agent[]> {
       agents = result.agents || result.data || Object.values(result);
     }
 
-    cachedAgents = agents.filter((a) => {
+    cachedAgents = agents.filter((a: any) => {
       const mode = a.mode || a.type || "all";
       return mode === "subagent";
     });
@@ -190,45 +230,10 @@ async function fetchAgents(client: any): Promise<Agent[]> {
   return cachedAgents;
 }
 
-async function pollForResponse(
-  client: any,
-  sessionId: string,
-  maxWaitMs: number,
-  startIndex: number = 0,
-  checkInterval: number = POLL_INTERVAL
-): Promise<string> {
-  const started = Date.now();
-  let pollErrors = 0;
-
-  while (Date.now() - started < maxWaitMs) {
-    try {
-      const messages = await readSessionMessages(client, sessionId);
-      const latest = getLatestAssistantText(messages, startIndex);
-      if (latest.trim()) return latest;
-
-      const sessionInfo = await client.session.get({ path: { id: sessionId } });
-      const status = extractSessionStatus(sessionInfo, messages);
-
-      if (status === "idle" || status === "completed" || status === "error") {
-        const finalMessages = await readSessionMessages(client, sessionId);
-        const finalText = getLatestAssistantText(finalMessages, startIndex);
-        if (finalText.trim()) return finalText;
-        return "(Subagent completed with no new text output)";
-      }
-    } catch (e: any) {
-      pollErrors += 1;
-      if (pollErrors >= 5) {
-        return `(Error polling session: ${e.message})`;
-      }
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, checkInterval));
-  }
-
-  return `(Timed out after ${maxWaitMs / 1000}s. Session: ${sessionId})`;
+function truncateText(text: string, maxChars: number = 1200): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}...`;
 }
-
-
 
 async function notifyParentSession(client: any, parentSessionId: string, message: string): Promise<void> {
   try {
@@ -247,114 +252,166 @@ async function notifyParentSession(client: any, parentSessionId: string, message
   }
 }
 
-function registerBackgroundTask(client: any, state: BackgroundTaskState): void {
-  if (backgroundTasks.size >= MAX_CONCURRENT_TASKS) {
-    throw new Error(
-      `Cannot register more than ${MAX_CONCURRENT_TASKS} concurrent background tasks ` +
-      `(current: ${backgroundTasks.size}). Set DYNAMIC_TASK_MAX_CONCURRENT to increase.`
-    );
+function handleTimeout(store: TaskStore, childSessionId: string, client: any, config: DynamicTaskConfig,
+  pendingSyncRequests: Map<string, { resolve: (result: any) => void; reject: (error: Error) => void; timeoutHandle: ReturnType<typeof setTimeout>; }>): void {
+  const task = store.activeTasks.get(childSessionId);
+  if (!task || task.completed) return;
+
+  task.timeoutNotified = true;
+  task.completed = true;
+
+  const timeoutMessage = formatParentNotification({
+    childSessionId: task.childSessionId,
+    description: task.description,
+    timeoutMs: config.defaultTimeoutMs,
+  }, "timeout");
+
+  if (config.timeoutBehavior === "interrupt") {
+    // Attempt to abort with a timeout
+    const abortPromise = client.session.abort({ path: { id: childSessionId } }).catch((err: any) => ({
+      aborted: false,
+      error: err.message,
+    }));
+    Promise.race([
+      abortPromise,
+      new Promise((_, reject) =>
+        config.timerProvider.setTimeout(() => reject(new Error("abort timeout")), 5000)
+      ),
+    ]).catch(() => {});
+
+    transitionState(store, childSessionId, "timed_out_retained", config);
+  } else if (config.timeoutBehavior === "notify") {
+    transitionState(store, childSessionId, "timed_out_retained", config);
+  } else {
+    // notify_untrack — move to retained but don't abort
+    transitionState(store, childSessionId, "timed_out_retained", config);
   }
 
-  const existing = backgroundTasks.get(state.childSessionId);
-  if (existing?.timeoutHandle) clearTimeout(existing.timeoutHandle);
+  notifyParentSession(client, task.parentSessionId, timeoutMessage);
 
-  state.timeoutHandle = setTimeout(async () => {
-    const active = backgroundTasks.get(state.childSessionId);
-    if (!active || active.timeoutNotified) return;
+  // Clean up any pending sync request
+  const pending = pendingSyncRequests.get(childSessionId);
+  if (pending) {
+    config.timerProvider.clearTimeout(pending.timeoutHandle);
+    pendingSyncRequests.delete(childSessionId);
+  }
 
-    active.timeoutNotified = true;
-    const timeoutMessage = formatParentNotification(active, "timeout");
-    await notifyParentSession(client, active.parentSessionId, timeoutMessage);
-    backgroundTasks.delete(state.childSessionId);
-
-    debugLog(active.parentSessionId, active.childSessionId, "timeout-fired", {
-      timeoutMs: active.timeoutMs,
-      timeoutNotified: active.timeoutNotified,
-    });
-  }, state.timeoutMs);
-
-  backgroundTasks.set(state.childSessionId, state);
+  debugLog(task.parentSessionId, childSessionId, "timeout-fired", {
+    timeoutBehavior: config.timeoutBehavior,
+    childSessionId,
+  });
 }
 
 async function handleChildLifecycleEvent(client: any, event: any): Promise<void> {
+  if (!pluginState) return;
+  const { store, config, pendingSyncRequests } = pluginState;
+
   if (!isTerminalSessionEvent(event)) return;
 
   const childSessionId = getSessionIdFromEvent(event);
   if (!childSessionId) return;
 
-  const tracked = backgroundTasks.get(childSessionId);
-  if (!tracked) return;
-  if (tracked.completed) return; // already notified, prevent duplicate
-  tracked.completed = true;
+  // Check active tasks first
+  const active = store.activeTasks.get(childSessionId);
+  if (active) {
+    if (active.completed) return;
+    active.completed = true;
 
-  if (tracked.timeoutHandle) {
-    clearTimeout(tracked.timeoutHandle);
-    tracked.timeoutHandle = null;
+    const status = getEventLifecycleStatus(event);
+    let kind: "timeout" | "completed" | "completed_after_timeout" | "error" = "completed";
+    if (status === "error") {
+      kind = "error";
+      transitionState(store, childSessionId, "error", config);
+    } else if (active.timeoutNotified) {
+      kind = "completed_after_timeout";
+      transitionState(store, childSessionId, "completed_after_timeout", config);
+    } else {
+      transitionState(store, childSessionId, "completed", config);
+    }
+
+    // Check if there's a pending sync request for this task
+    const pending = pendingSyncRequests.get(childSessionId);
+    if (pending) {
+      config.timerProvider.clearTimeout(pending.timeoutHandle);
+      pendingSyncRequests.delete(childSessionId);
+    }
+
+    const latestText = "(completed)";
+    const parentMessage = formatParentNotification({
+      childSessionId: active.childSessionId,
+      description: active.description,
+      timeoutMs: config.defaultTimeoutMs,
+    }, kind, latestText);
+    await notifyParentSession(client, active.parentSessionId, parentMessage);
+
+    debugLog(active.parentSessionId, childSessionId, "child-lifecycle-event", {
+      status,
+      kind,
+      timeoutNotified: active.timeoutNotified,
+    });
+    return;
   }
 
-  const status = getEventLifecycleStatus(event);
-  const eventType = event?.type;
-
-  const eventMessages = Array.isArray(event?.properties?.messages) ? event.properties.messages : [];
-  let latestText = getLatestAssistantText(eventMessages, 0);
-  if (!latestText) {
-    try {
-      const sessionMessages = await readSessionMessages(client, childSessionId);
-      latestText = getLatestAssistantText(sessionMessages, 0);
-    } catch {
-      latestText = "";
+  // Check retained tasks — update state but don't notify
+  const retained = store.retainedTasks.get(childSessionId);
+  if (retained) {
+    const status = getEventLifecycleStatus(event);
+    if (status === "error") {
+      retained.state = "error";
+    } else if (retained.state === "timed_out_retained") {
+      retained.state = "completed_after_timeout";
     }
   }
-
-  let kind: "timeout" | "completed" | "completed_after_timeout" | "error" = "completed";
-  if (eventType === "session.error" || status === "error") {
-    kind = "error";
-  } else if (tracked.timeoutNotified) {
-    kind = "completed_after_timeout";
-  }
-
-  debugLog(tracked.parentSessionId, childSessionId, "child-lifecycle-event", {
-    eventType,
-    status,
-    kind,
-    timeoutNotified: tracked.timeoutNotified,
-  });
-
-  const parentMessage = formatParentNotification(tracked, kind, latestText);
-  await notifyParentSession(client, tracked.parentSessionId, parentMessage);
-  backgroundTasks.delete(childSessionId);
 }
 
-export default async function dynamicTaskPlugin({
-  client,
-  directory,
-}: {
-  client: any;
-  directory: string;
-}) {
+function createDummyLineage(ctx: any): string[] {
+  // Try to derive parent agent from ctx
+  // This is best-effort — lineage[] may be empty for root-level calls
+  return [];
+}
+
+export default async function dynamicTaskPlugin(
+  input: { client: any; directory: string },
+  options: any = {},
+) {
+  const { client, directory } = input;
+
   if (!client?.app?.agents || !client?.session?.create || !client?.session?.prompt) {
-    await client.app.log({
-      body: {
-        service: "dynamic-task",
-        level: "warn",
-        message: "Missing required client APIs, plugin disabled",
-      },
-    });
+    try {
+      await client.app?.log?.({
+        body: {
+          service: "dynamic-task",
+          level: "warn",
+          message: "Missing required client APIs, plugin disabled",
+        },
+      });
+    } catch { /* silent failure */ }
     return {};
   }
+
+  // Initialize state at plugin load time
+  pluginState = initPluginState(directory, options);
+  const state = pluginState;
+  const { config, store, pendingSyncRequests } = state;
+
+  // Load persisted task ID mappings
+  try {
+    const taskMap = loadTaskIdMap();
+    for (const [k, v] of taskMap) {
+      taskIdToSessionId.set(k, v);
+    }
+  } catch { /* ignore */ }
 
   await client.app.log({
     body: {
       service: "dynamic-task",
       level: "info",
-      message:
-        "Plugin loaded with dynamic_task, task_continue, task_result, and task_interrupt tools",
+      message: "Plugin loaded with dynamic_task, task_continue, task_result, and task_interrupt tools",
     },
   });
 
   return {
     event: async ({ event }: any) => {
-      // Always-on diagnostic: log every event via client.app.log
       const eventType = event?.type;
       const eventName = event?.name;
       const evtSessionId = getSessionIdFromEvent(event);
@@ -376,6 +433,77 @@ export default async function dynamicTaskPlugin({
         status: evtStatus,
       });
 
+      // --- Question API handlers ---
+      try {
+        if (event?.type === "question.created") {
+          const questionId = event.properties?.id;
+          if (!questionId) {
+            debugLog("unknown", "unknown", "question-missing-id", { type: event.type });
+          } else {
+            let childSessionId = questionIdToSessionId.get(questionId) || null;
+
+            if (!childSessionId) {
+              for (const [sessionId, task] of store.activeTasks) {
+                if (task.completed) continue;
+                // Find by matching session ID pattern
+              }
+            }
+
+            // Check if this question is for a retained task
+            const retainedTask = childSessionId ? store.retainedTasks.get(childSessionId) : null;
+            if (retainedTask) {
+              // M3: Questions for retained tasks are rejected with guidance
+              await rejectQuestion(client, questionId,
+                "This task timed out in the parent session. No response will be provided.");
+              debugLog("unknown", childSessionId || "unknown", "question-retained-rejected", { questionId });
+            } else if (childSessionId && store.activeTasks.has(childSessionId)) {
+              const task = store.activeTasks.get(childSessionId)!;
+              questionIdToSessionId.set(questionId, childSessionId);
+
+              const answers = normalizeQuestionAnswers(event.properties?.answers);
+              if (answers.length > 0) {
+                const result = await replyToQuestion(client, questionId, answers[0]);
+                if (!result.succeeded) {
+                  debugLog("unknown", childSessionId, "question-auto-answer-failed", {
+                    questionId,
+                    reason: result.reason,
+                  });
+                  const rejectResult = await rejectQuestion(client, questionId,
+                    "Background task question auto-answer failed");
+                  if (!rejectResult.succeeded) {
+                    debugLog("unknown", childSessionId, "question-auto-reject-failed", {
+                      questionId,
+                      reason: rejectResult.reason,
+                    });
+                  }
+                }
+              } else {
+                const result = await rejectQuestion(client, questionId,
+                  "Background task — use task_continue for follow-up");
+                if (!result.succeeded) {
+                  debugLog("unknown", childSessionId, "question-auto-reject-failed", {
+                    questionId,
+                    reason: result.reason,
+                  });
+                }
+              }
+            } else {
+              debugLog("unknown", "unknown", "question-unmatched", { questionId, type: event.type });
+            }
+          }
+        }
+
+        if (event?.type === "question.replied" || event?.type === "question.rejected") {
+          const questionId = event.properties?.id;
+          if (questionId) {
+            questionIdToSessionId.delete(questionId);
+          }
+        }
+      } catch (qerr: any) {
+        debugLog("unknown", "unknown", "question-handler-error", { error: qerr?.message });
+      }
+
+      // --- Session lifecycle event handler ---
       try {
         await handleChildLifecycleEvent(client, event);
       } catch (e: any) {
@@ -403,13 +531,30 @@ export default async function dynamicTaskPlugin({
           await_response: tool.schema
             .boolean()
             .optional()
-            .describe("If true (default), wait for response. If false, return immediately."),
+            .describe("If true, wait for response. If false (default), return immediately."),
           timeout_ms: tool.schema
             .number()
             .optional()
             .describe("Max wait in ms for awaiting mode or timeout notification in background mode."),
         },
         async execute(args: any, ctx: any) {
+          // Deprecation warning for missing await_response
+          if (state.config.defaultAwaitResponse === false && args.await_response === undefined) {
+            if (!state.deprecationWarned) {
+              state.deprecationWarned = true;
+              await client.app.log({
+                body: {
+                  service: "dynamic-task",
+                  level: "warn",
+                  message: "Deprecation: dynamic_task now runs async by default. Pass await_response: true for sync behavior.",
+                },
+              });
+            }
+          }
+
+          // Prune retained tasks before any operation
+          pruneRetainedTasks(store, config);
+
           const agents = await fetchAgents(client);
           const requestedName = args.subagent_type?.toLowerCase()?.trim();
 
@@ -417,7 +562,7 @@ export default async function dynamicTaskPlugin({
             return `ERROR: No subagent_type provided.\n\nAvailable: ${buildAgentList(agents)}`;
           }
 
-          const agent = agents.find((a) => a.name.toLowerCase() === requestedName);
+          const agent = agents.find((a: any) => a.name.toLowerCase() === requestedName);
           if (!agent) {
             return `ERROR: Agent "${args.subagent_type}" not found.\n\nAvailable: ${buildAgentList(agents)}`;
           }
@@ -430,8 +575,22 @@ export default async function dynamicTaskPlugin({
             return `ERROR: Prompt too long (${args.prompt.length} chars). Max: 100000.`;
           }
 
-          const timeoutMs = Number(args.timeout_ms) > 0 ? Number(args.timeout_ms) : DEFAULT_WAIT_MS;
-          const shouldAwait = args.await_response !== false;
+          // Resolve config values
+          const timeoutMs = resolveTimeoutMs(args.timeout_ms, config);
+          const shouldAwait = resolveAwaitResponse(args.await_response, config);
+
+          // Policy checks before session.create
+          const lineage = createDummyLineage(ctx);
+
+          const agentCheck = validateAgent(agent.name, config);
+          if (!agentCheck.ok) {
+            return `ERROR: ${agentCheck.error}`;
+          }
+
+          const lineageCheck = validateLineage(lineage, agent.name, config);
+          if (!lineageCheck.ok) {
+            return `ERROR: ${lineageCheck.error}`;
+          }
 
           try {
             const sessionBody: any = {
@@ -454,7 +613,25 @@ export default async function dynamicTaskPlugin({
               return `ERROR: Failed to create session. Response: ${JSON.stringify(sessionResult)}`;
             }
 
-            const baselineCount = await getMessageCount(client, childSessionId);
+            // Register in active state
+            const newLineage = buildTaskLineage(lineage, agent.name);
+            const isBg = !shouldAwait;
+
+            const activeTask = registerActiveTask(store, {
+              childSessionId,
+              parentSessionId: parentSessionId || "unknown",
+              agentName: agent.name,
+              description: args.description || `Task: ${agent.name}`,
+              lineage: newLineage,
+              isBackground: isBg,
+            }, config);
+
+            // Persist taskId mapping
+            if (args.description && validateTaskId(args.description)) {
+              taskIdToSessionId.set(childSessionId, args.description);
+              saveTaskIdMap(taskIdToSessionId);
+            }
+
             const childPrompt = shouldAwait ? args.prompt : buildBackgroundPrompt(args.prompt);
             await client.session.prompt({
               path: { id: childSessionId },
@@ -462,25 +639,19 @@ export default async function dynamicTaskPlugin({
             });
 
             if (!shouldAwait) {
+              // Fire-and-forget background mode
+              const timeoutHandle = config.timerProvider.setTimeout(
+                () => handleTimeout(store, childSessionId, client, config, pendingSyncRequests),
+                timeoutMs,
+              );
+
+              debugLog(parentSessionId || "unknown", childSessionId, "background-task-registered", {
+                timeoutMs,
+                description: args.description || `Task: ${agent.name}`,
+                shouldAwait: false,
+              });
+
               if (parentSessionId) {
-                registerBackgroundTask(client, {
-                  childSessionId,
-                  parentSessionId,
-                  description: args.description || `Task: ${agent.name}`,
-                  agentName: agent.name,
-                  timeoutMs,
-                  startedAt: Date.now(),
-                  timeoutNotified: false,
-                  completed: false,
-                  timeoutHandle: null,
-                });
-
-                debugLog(parentSessionId, childSessionId, "background-task-registered", {
-                  timeoutMs,
-                  description: args.description || `Task: ${agent.name}`,
-                  shouldAwait: false,
-                });
-
                 return [
                   `Spawned @${agent.name} in background.`,
                   `Session: ${childSessionId}`,
@@ -496,8 +667,41 @@ export default async function dynamicTaskPlugin({
               ].join("\n");
             }
 
-            const response = await pollForResponse(client, childSessionId, timeoutMs, baselineCount);
-            return `## @${agent.name} Response\n\n${response}\n\n---\n*Session: ${childSessionId}*`;
+            // Sync mode — event-based wait
+            const baselineCount = await getMessageCount(client, childSessionId);
+
+            // Create a sync Promise that resolves on terminal event or timeout
+            const syncResult = await new Promise<string>((resolve, reject) => {
+              const timeoutHandle = config.timerProvider.setTimeout(async () => {
+                pendingSyncRequests.delete(childSessionId);
+                // Abort on sync timeout
+                if (config.timeoutBehavior === "interrupt") {
+                  try {
+                    await client.session.abort({ path: { id: childSessionId } });
+                  } catch { /* ignore abort failure */ }
+                }
+                transitionState(store, childSessionId, "timed_out_retained", config);
+                resolve(`(Timed out after ${timeoutMs / 1000}s. Session: ${childSessionId}. Use task_continue to resume.)`);
+              }, timeoutMs);
+
+              // Register the resolver so the event handler can complete it
+              pendingSyncRequests.set(childSessionId, {
+                resolve: (result: any) => {
+                  config.timerProvider.clearTimeout(timeoutHandle);
+                  resolve(result.text || "(Subagent completed)");
+                },
+                reject: (err: Error) => {
+                  config.timerProvider.clearTimeout(timeoutHandle);
+                  reject(err);
+                },
+                timeoutHandle,
+              });
+
+              // De-register on child completion via the event handler
+              // If no event comes, timeout resolves the promise
+            });
+
+            return `## @${agent.name} Response\n\n${syncResult}\n\n---\n*Session: ${childSessionId}*`;
           } catch (error: any) {
             if (error.message?.includes("not found")) {
               return `ERROR: Agent "${agent.name}" not found.`;
@@ -526,22 +730,132 @@ export default async function dynamicTaskPlugin({
             return `ERROR: Prompt too long (${args.prompt.length} chars).`;
           }
 
-          const timeoutMs = Number(args.timeout_ms) > 0 ? Number(args.timeout_ms) : DEFAULT_WAIT_MS;
+          pruneRetainedTasks(store, config);
 
-          try {
-            const baselineCount = await getMessageCount(client, args.session_id);
-            await client.session.prompt({
-              path: { id: args.session_id },
-              body: { parts: [{ type: "text", text: args.prompt }] },
-            });
+          // Check if this is a retained task — spawn new session
+          const retained = store.retainedTasks.get(args.session_id);
+          if (retained) {
+            // Spawn a new child session with the same agent
+            try {
+              const sessionBody: any = {
+                title: `Continuation: ${retained.description}`,
+                agent: retained.agentName,
+              };
+              if (retained.parentSessionId) {
+                sessionBody.parentID = retained.parentSessionId;
+              }
 
-            const response = await pollForResponse(client, args.session_id, timeoutMs, baselineCount);
-            return `## Follow-up Response\n\n${response}\n\n---\n*Session: ${args.session_id}*`;
-          } catch (error: any) {
-            if (error.message?.includes("not found")) {
-              return `ERROR: Session "${args.session_id}" not found.`;
+              const sessionResult = await client.session.create({
+                body: sessionBody,
+                query: { directory: directory || "" },
+              });
+
+              const newSessionId = validateSessionResult(sessionResult);
+              if (!newSessionId) {
+                return `ERROR: Failed to create continuation session. Response: ${JSON.stringify(sessionResult)}`;
+              }
+
+              // Register new active task for the continuation
+              const activeTask = registerActiveTask(store, {
+                childSessionId: newSessionId,
+                parentSessionId: retained.parentSessionId,
+                agentName: retained.agentName,
+                description: `Continue: ${retained.description}`,
+                lineage: retained.lineage,
+                isBackground: false,
+              }, config);
+
+              const timeoutMs = resolveTimeoutMs(args.timeout_ms, config);
+              await client.session.prompt({
+                path: { id: newSessionId },
+                body: { parts: [{ type: "text", text: args.prompt }] },
+              });
+
+              // Sync wait for response
+              const baselineCount = await getMessageCount(client, newSessionId);
+              const response = await new Promise<string>((resolve) => {
+                const timeoutHandle = config.timerProvider.setTimeout(() => {
+                  pendingSyncRequests.delete(newSessionId);
+                  if (config.timeoutBehavior === "interrupt") {
+                    client.session.abort({ path: { id: newSessionId } }).catch(() => {});
+                  }
+                  resolve(`(Timed out after ${timeoutMs / 1000}s. Continuation session: ${newSessionId})`);
+                }, timeoutMs);
+
+                pendingSyncRequests.set(newSessionId, {
+                  resolve: (result: any) => {
+                    config.timerProvider.clearTimeout(timeoutHandle);
+                    resolve(result.text || "(Subagent completed)");
+                  },
+                  reject: (err: Error) => {
+                    config.timerProvider.clearTimeout(timeoutHandle);
+                    resolve(`(Error: ${err.message})`);
+                  },
+                  timeoutHandle,
+                });
+              });
+
+              return `## Follow-up Response (new session)\n\n${response}\n\n---\n*Previous session: ${args.session_id}*  *New session: ${newSessionId}*`;
+            } catch (error: any) {
+              return `ERROR: ${error.message}`;
             }
-            return `ERROR: ${error.message}`;
+          }
+
+          // Not a retained task — check if it's active
+          const active = store.activeTasks.get(args.session_id);
+          if (active) {
+            // Send prompt to existing active session
+            const timeoutMs = resolveTimeoutMs(args.timeout_ms, config);
+            try {
+              const baselineCount = await getMessageCount(client, args.session_id);
+              await client.session.prompt({
+                path: { id: args.session_id },
+                body: { parts: [{ type: "text", text: args.prompt }] },
+              });
+
+              const response = await new Promise<string>((resolve) => {
+                const timeoutHandle = config.timerProvider.setTimeout(() => {
+                  pendingSyncRequests.delete(args.session_id);
+                  resolve(`(Timed out after ${timeoutMs / 1000}s. Session: ${args.session_id})`);
+                }, timeoutMs);
+
+                pendingSyncRequests.set(args.session_id, {
+                  resolve: (result: any) => {
+                    config.timerProvider.clearTimeout(timeoutHandle);
+                    resolve(result.text || "(Subagent completed)");
+                  },
+                  reject: (err: Error) => {
+                    config.timerProvider.clearTimeout(timeoutHandle);
+                    resolve(`(Error: ${err.message})`);
+                  },
+                  timeoutHandle,
+                });
+              });
+
+              return `## Follow-up Response\n\n${response}\n\n---\n*Session: ${args.session_id}*`;
+            } catch (error: any) {
+              if (error.message?.includes("not found")) {
+                return `ERROR: Session "${args.session_id}" not found.`;
+              }
+              return `ERROR: ${error.message}`;
+            }
+          }
+
+          // Unknown session — query the API
+          try {
+            const sessionInfo = await client.session.get({ path: { id: args.session_id } });
+            const messages = await readSessionMessages(client, args.session_id);
+            const status = extractSessionStatus(sessionInfo, messages);
+            return formatTaskResultSummary({
+              sessionId: args.session_id,
+              status,
+              messageCount: messages.length,
+              latestText: getLatestAssistantText(messages, 0) || "(No assistant text found)",
+              tracked: false,
+              timeoutNotified: false,
+            });
+          } catch {
+            return JSON.stringify({ status: "unknown", session_id: args.session_id });
           }
         },
       }),
@@ -556,72 +870,69 @@ export default async function dynamicTaskPlugin({
             return "ERROR: session_id is required.";
           }
 
+          // Search active first, then retained
+          const task = findTask(store, args.session_id);
+          if (task) {
+            // Check if it's still in active and may need API query for latest output
+            try {
+              const sessionInfo = await client.session.get({ path: { id: args.session_id } });
+              const messages = await readSessionMessages(client, args.session_id);
+              const status = task.state === "active"
+                ? extractSessionStatus(sessionInfo, messages)
+                : task.state;
+
+              const latest = getLatestAssistantText(messages, 0) || "(No assistant text found)";
+
+              const isTracked = store.activeTasks.has(args.session_id) ||
+                store.retainedTasks.has(args.session_id);
+
+              return formatTaskResultSummary({
+                sessionId: args.session_id,
+                status,
+                messageCount: messages.length,
+                latestText: truncateText(latest),
+                tracked: isTracked,
+                timeoutNotified: "timeoutNotified" in task ? Boolean(task.timeoutNotified) : false,
+              });
+            } catch {
+              // API error — return what we know from state
+              return formatTaskResultSummary({
+                sessionId: args.session_id,
+                status: task.state,
+                messageCount: 0,
+                latestText: "(API unavailable)",
+                tracked: true,
+                timeoutNotified: "timeoutNotified" in task ? Boolean(task.timeoutNotified) : false,
+              });
+            }
+          }
+
+          // Not in our state — query API, gracefully handle errors
           try {
             const sessionInfo = await client.session.get({ path: { id: args.session_id } });
             const messages = await readSessionMessages(client, args.session_id);
             const status = extractSessionStatus(sessionInfo, messages);
-
-            // Always-on diagnostic: log raw sessionInfo structure
-            const infoKeys = sessionInfo ? Object.keys(sessionInfo).slice(0, 8).join(",") : "(null)";
-            const bodyKeys = sessionInfo?.body ? Object.keys(sessionInfo.body).slice(0, 8).join(",") : "(none)";
-            await client.app.log({
-              body: {
-                service: "dynamic-task",
-                level: "info",
-                message: `task_result: sid=${args.session_id} status=${status} info.keys=[${infoKeys}] body.keys=[${bodyKeys}] raw.status=${JSON.stringify(sessionInfo?.status)} raw.body.status=${JSON.stringify(sessionInfo?.body?.status)}`,
-              },
-            });
             const latest = getLatestAssistantText(messages, 0) || "(No assistant text found)";
-            const tracked = backgroundTasks.get(args.session_id);
-
-            // Safety net: if session is done but background task still has a pending timeout,
-            // cancel the timeout and clean up. This catches cases where the event handler
-            // missed the completion event.
-            if (tracked && !tracked.timeoutNotified && !tracked.completed && ["idle", "completed", "error"].includes(status)) {
-              if (tracked.timeoutHandle) {
-                clearTimeout(tracked.timeoutHandle);
-                tracked.timeoutHandle = null;
-              }
-              tracked.completed = true;
-              debugLog(tracked.parentSessionId, args.session_id, "safety-net-cleanup", {
-                status,
-                source: "task_result",
-              });
-              backgroundTasks.delete(args.session_id);
-            }
-
-            // Fallback safety net: if status is "unknown" but the session has meaningful
-            // assistant output and is tracked, cancel the timeout anyway. The task clearly
-            // completed — we just can't determine the exact status field.
-            if (tracked && !tracked.timeoutNotified && !tracked.completed && status === "unknown" && latest.trim() && latest !== "(No assistant text found)" && messages.length >= 2) {
-              if (tracked.timeoutHandle) {
-                clearTimeout(tracked.timeoutHandle);
-                tracked.timeoutHandle = null;
-              }
-              tracked.completed = true;
-              debugLog(tracked.parentSessionId, args.session_id, "safety-net-fallback", {
-                status,
-                messageCount: messages.length,
-                hasOutput: true,
-                source: "task_result",
-              });
-              backgroundTasks.delete(args.session_id);
-            }
 
             return formatTaskResultSummary({
               sessionId: args.session_id,
               status,
               messageCount: messages.length,
-              latestText: latest,
-              tracked: Boolean(tracked),
-              timeoutNotified: Boolean(tracked?.timeoutNotified),
-              debugShape: status === "unknown" ? JSON.stringify(sessionInfo).slice(0, 1000) : undefined,
+              latestText: truncateText(latest),
+              tracked: false,
+              timeoutNotified: false,
             });
-          } catch (error: any) {
-            if (error.message?.includes("not found")) {
-              return `ERROR: Session "${args.session_id}" not found.`;
+          } catch (err: any) {
+            // 404 or network error → return unknown state
+            if (err?.status === 404 || err?.message?.includes("not found")) {
+              return JSON.stringify({ status: "unknown", session_id: args.session_id });
             }
-            return `ERROR: ${error.message}`;
+            return JSON.stringify({
+              status: "error",
+              session_id: args.session_id,
+              error: err?.message || "Network error querying session",
+              retryable: err?.code === "ECONNREFUSED" || err?.code === "ETIMEDOUT",
+            });
           }
         },
       }),
@@ -638,6 +949,19 @@ export default async function dynamicTaskPlugin({
 
           try {
             await client.session.abort({ path: { id: args.session_id } });
+
+            // Clean up from active tasks if present
+            const active = store.activeTasks.get(args.session_id);
+            if (active) {
+              transitionState(store, args.session_id, "interrupted", config);
+            }
+
+            // Clean up from retained tasks if present
+            const retained = store.retainedTasks.get(args.session_id);
+            if (retained) {
+              store.retainedTasks.delete(args.session_id);
+            }
+
             return `Session ${args.session_id} interrupted.`;
           } catch (error: any) {
             if (error.message?.includes("not found")) {
