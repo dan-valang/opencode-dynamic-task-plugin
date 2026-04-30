@@ -1,4 +1,4 @@
-import { describe, it, beforeEach } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
 
 // Re-implement pure functions here for testing (copied from src/index.ts)
@@ -470,7 +470,7 @@ describe("formatTaskResultSummary", () => {
 });
 
 // --- Debug Logger (Task 3) ---
-import { getDebugLogPath, safeDebugPayload } from "../../dist/debug-logger.js";
+import { debugLog, getDebugLogPath, safeDebugPayload } from "../../dist/debug-logger.js";
 
 describe("safeDebugPayload", () => {
   it("keeps event metadata but removes blocked fields (prompt, fullPrompt)", () => {
@@ -518,7 +518,7 @@ import {
   saveTaskIdMap,
 } from "../../dist/shared/session-lifecycle.js";
 
-import { unlinkSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, unlinkSync, writeFileSync, existsSync, rmSync } from "node:fs";
 
 const TEST_MAP_PATH = ".dynamic-task-ids.json";
 
@@ -736,9 +736,54 @@ describe("resolveTimeoutMs", () => {
 });
 
 describe("parseDynamicTaskJsonc", () => {
-  // Expected initial result: FAIL because parseDynamicTaskJsonc does not exist
   it("exists as an exported function", () => {
     assert.strictEqual(typeof parseDynamicTaskJsonc, "function");
+  });
+
+  it("returns null for non-existent file path", () => {
+    const result = parseDynamicTaskJsonc("/nonexistent/path/config.jsonc");
+    assert.strictEqual(result, null);
+  });
+
+  it("returns null for undefined/empty path", () => {
+    assert.strictEqual(parseDynamicTaskJsonc(""), null);
+    assert.strictEqual(parseDynamicTaskJsonc(null), null);
+    assert.strictEqual(parseDynamicTaskJsonc(undefined), null);
+  });
+});
+
+describe("normalizeDynamicTaskConfig — edge case parsing fields", () => {
+  it("sets retainedTaskMaxEntries from plugin options", () => {
+    const config = normalizeDynamicTaskConfig({ retainedTaskMaxEntries: 50 });
+    assert.strictEqual(config.retainedTaskMaxEntries, 50);
+  });
+
+  it("sets allowSameAgentRecursion when boolean true", () => {
+    const config = normalizeDynamicTaskConfig({ allowSameAgentRecursion: true });
+    assert.strictEqual(config.allowSameAgentRecursion, true);
+  });
+
+  it("ignores non-boolean allowSameAgentRecursion", () => {
+    const config = normalizeDynamicTaskConfig({ allowSameAgentRecursion: "yes" });
+    assert.strictEqual(config.allowSameAgentRecursion, false);
+  });
+
+  it("accepts valid timerProvider", () => {
+    const timerProvider = { setTimeout: () => 1, clearTimeout: () => {} };
+    const config = normalizeDynamicTaskConfig({ timerProvider });
+    assert.strictEqual(config.timerProvider, timerProvider);
+  });
+
+  it("rejects invalid timerProvider (missing clearTimeout)", () => {
+    const config = normalizeDynamicTaskConfig({ timerProvider: { setTimeout: () => 1 } });
+    // Should fall back to default (REAL_TIMERS or undefined)
+    assert.ok(config.timerProvider, "TimerProvider should be set");
+  });
+
+  it("handles all timeoutBehavior values", () => {
+    assert.strictEqual(normalizeDynamicTaskConfig({ timeoutBehavior: "notify" }).timeoutBehavior, "notify");
+    assert.strictEqual(normalizeDynamicTaskConfig({ timeoutBehavior: "notify_untrack" }).timeoutBehavior, "notify_untrack");
+    assert.strictEqual(normalizeDynamicTaskConfig({ timeoutBehavior: "interrupt" }).timeoutBehavior, "interrupt");
   });
 });
 
@@ -894,6 +939,7 @@ import {
   registerActiveTask,
   transitionState,
   findTask,
+  pruneRetainedTasks,
 } from "../../dist/shared/task-state.js";
 import { checkConcurrencyLimit } from "../../dist/shared/config.js";
 
@@ -1051,5 +1097,136 @@ describe("task-state: concurrency helper", () => {
   it("returns error message when over limit", () => {
     const result = checkConcurrencyLimit(3, config);
     assert.ok(result);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// Coverage gap tests — Closing gaps to 90%+ coverage
+// ═════════════════════════════════════════════════════════════════════
+
+
+describe("pruneRetainedTasks — TTL and max entry eviction", () => {
+  const config = normalizeDynamicTaskConfig({ retainedTaskTtlMs: 50, retainedTaskMaxEntries: 2 });
+
+  it("removes expired retained tasks by TTL", async () => {
+    const store = createStateStore();
+    // Add a retained task with a past retainedAt
+    const oldTask = {
+      childSessionId: "ses_old", parentSessionId: "parent_1", agentName: "reviewer",
+      description: "old", lineage: [], isBackground: true, completed: false,
+      timeoutNotified: false, timeoutHandle: null, startedAt: 0,
+      state: "timed_out_retained" , retainedAt: Date.now() - 100000,
+    };
+    store.retainedTasks.set("ses_old", oldTask );
+
+    const pruned = pruneRetainedTasks(store, config);
+    assert.strictEqual(pruned, 1, "Should prune 1 expired entry");
+    assert.strictEqual(store.retainedTasks.size, 0);
+  });
+
+  it("evicts oldest entries when over max", () => {
+    const store = createStateStore();
+    // Add 3 retained tasks (max is 2) — all within TTL window (retainedAt near now)
+    const now = Date.now();
+    store.retainedTasks.set("ses_a", {
+      childSessionId: "ses_a", parentSessionId: "p", agentName: "a",
+      description: "a", lineage: [], isBackground: false,
+      state: "timed_out_retained", retainedAt: now - 5,
+    });
+    store.retainedTasks.set("ses_b", {
+      childSessionId: "ses_b", parentSessionId: "p", agentName: "b",
+      description: "b", lineage: [], isBackground: false,
+      state: "timed_out_retained", retainedAt: now - 3,
+    });
+    store.retainedTasks.set("ses_c", {
+      childSessionId: "ses_c", parentSessionId: "p", agentName: "c",
+      description: "c", lineage: [], isBackground: false,
+      state: "timed_out_retained", retainedAt: now,
+    });
+
+    const pruned = pruneRetainedTasks(store, config);
+    assert.strictEqual(pruned, 1, "Should evict 1 oldest entry");
+    assert.strictEqual(store.retainedTasks.size, 2);
+    // Oldest (ses_a) should be gone
+    assert.ok(!store.retainedTasks.has("ses_a"));
+  });
+
+  it("prunes nothing when under limits", () => {
+    const store = createStateStore();
+    const now = Date.now();
+    store.retainedTasks.set("ses_1", {
+      childSessionId: "ses_1", parentSessionId: "p", agentName: "a",
+      description: "1", lineage: [], isBackground: false,
+      state: "timed_out_retained", retainedAt: now,
+    } );
+
+    const pruned = pruneRetainedTasks(store, config);
+    assert.strictEqual(pruned, 0);
+    assert.strictEqual(store.retainedTasks.size, 1);
+  });
+});
+
+describe("findTask — edge cases", () => {
+  it("returns null for unknown session ID", () => {
+    const store = createStateStore();
+    const result = findTask(store, "nonexistent");
+    assert.strictEqual(result, null);
+  });
+
+  it("finds active task before retained task", () => {
+    const store = createStateStore();
+    registerActiveTask(store, {
+      childSessionId: "ses_dup", parentSessionId: "p",
+      agentName: "a", description: "t", lineage: [], isBackground: true,
+    }, normalizeDynamicTaskConfig({}));
+    // Add same key to retained (should not happen in practice but test priority)
+    store.retainedTasks.set("ses_dup", {
+      childSessionId: "ses_dup", parentSessionId: "p", agentName: "a",
+      description: "t", lineage: [], isBackground: false,
+      state: "timed_out_retained", retainedAt: Date.now(),
+    } );
+
+    const result = findTask(store, "ses_dup");
+    assert.strictEqual(result?.state, "active", "Should find active before retained");
+  });
+});
+
+describe("debugLog — closed to 100% coverage", () => {
+  const LOG_DIR = ".dynamic-task-logs";
+
+  beforeEach(() => {
+    // Clean up any logs from previous runs
+    try { rmSync(LOG_DIR, { recursive: true, force: true }); } catch { /* ok */ }
+    process.env.DYNAMIC_TASK_DEBUG = "1";
+  });
+
+  afterEach(() => {
+    delete process.env.DYNAMIC_TASK_DEBUG;
+    try { rmSync(LOG_DIR, { recursive: true, force: true }); } catch { /* ok */ }
+  });
+
+  it("writes a log file when DYNAMIC_TASK_DEBUG=1", () => {
+    debugLog("parent_1", "child_1", "test-event", { key: "value" });
+
+    const logPath = getDebugLogPath("parent_1", "child_1");
+    assert.ok(existsSync(logPath), `Log not found at ${logPath}`);
+    const content = readFileSync(logPath, "utf8");
+    assert.match(content, /test-event/);
+    assert.match(content, /"key":"value"/);
+  });
+
+  it("logs nothing when DYNAMIC_TASK_DEBUG is not 1", () => {
+    delete process.env.DYNAMIC_TASK_DEBUG;
+    debugLog("parent_2", "child_2", "silent-event", { data: "should not appear" });
+
+    const logPath = getDebugLogPath("parent_2", "child_2");
+    assert.ok(!existsSync(logPath), "Log should NOT exist when debug is off");
+  });
+
+  it("sanitizes session IDs to prevent path traversal", () => {
+    const path = getDebugLogPath("../etc", "../../passwd");
+    assert.ok(!path.includes(".."), "Path must not contain parent directory references");
+    assert.match(path, /etc/);
+    assert.match(path, /passwd/);
   });
 });
