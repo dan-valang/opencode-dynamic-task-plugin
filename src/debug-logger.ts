@@ -12,6 +12,7 @@ export function getDebugLogPath(parentSessionId: string, childSessionId: string)
 }
 
 export function safeDebugPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  if (!payload || typeof payload !== "object") return {};
   const blocklist = DEFAULT_DEBUG_BLOCKLIST;
   const clone: Record<string, unknown> = {};
   const keys = Object.keys(payload).slice(0, MAX_DEBUG_FIELDS);
