@@ -88,3 +88,37 @@ export function isTerminalSessionEvent(event: any): boolean {
 const raw = process.env.DYNAMIC_TASK_MAX_CONCURRENT;
 const parsed = Number(raw);
 export const MAX_CONCURRENT_TASKS = Number.isFinite(parsed) && parsed > 0 ? parsed : 4;
+
+// --- Task ID persistence (atomic JSON file) ---
+
+import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
+
+const TASK_ID_MAP_PATH = ".dynamic-task-ids.json";
+
+export function validateTaskId(taskId: string): boolean {
+  return typeof taskId === "string" && /^[a-zA-Z0-9_-]+$/.test(taskId) && taskId.length <= 64;
+}
+
+export function loadTaskIdMap(): Map<string, string> {
+  const map = new Map<string, string>();
+  if (existsSync(TASK_ID_MAP_PATH)) {
+    try {
+      const data = JSON.parse(readFileSync(TASK_ID_MAP_PATH, "utf8"));
+      for (const [taskId, sessionId] of Object.entries(data)) {
+        if (validateTaskId(taskId) && typeof sessionId === "string") {
+          map.set(taskId, sessionId);
+        }
+      }
+    } catch { /* ignore corrupt file */ }
+  }
+  return map;
+}
+
+export function saveTaskIdMap(map: Map<string, string>): void {
+  const obj: Record<string, string> = {};
+  for (const [k, v] of map) { obj[k] = v; }
+  // Atomic write: write to temp file, then rename to avoid corruption on crash
+  const tmp = TASK_ID_MAP_PATH + ".tmp";
+  writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  renameSync(tmp, TASK_ID_MAP_PATH);
+}
