@@ -108,8 +108,21 @@ src/
 ├── debug-logger.ts               # Opt-in file-based debug logging
 └── shared/
     ├── session-lifecycle.ts      # Status normalization, event parsing, terminal detection
-    └── task-formatting.ts        # Notification formatting, background prompt wrapper
+    ├── task-formatting.ts        # Notification formatting, background prompt wrapper
+    └── question-handling.ts      # Question API integration (auto-answer, reject, event handling)
 ```
+
+## Question Integration
+
+When `await_response=false` is used, child sessions may ask questions via the OpenCode Question API. The plugin automatically:
+
+1. Detects `question.created` events from background child sessions
+2. Looks up the child session via an internal `questionIdToSessionId` map
+3. Attempts to auto-answer with the first available option (if provided)
+4. Falls back to rejecting with guidance: "use `task_continue` for follow-up"
+5. Tracks `pendingQuestionId` on the background task state for cleanup
+
+Both `replyToQuestion()` and `rejectQuestion()` are idempotent — they silently succeed if the question is already resolved (409 Conflict). All errors are caught and logged, never thrown.
 
 ## Development
 
@@ -137,7 +150,7 @@ DYNAMIC_TASK_DEBUG=1 npm test
 
 ```bash
 npm run lint      # TypeScript type check
-npm test          # Full test suite (60 tests)
+npm test          # Full test suite (66 tests, sequential)
 ```
 
 Expected: lint passes, all 60 tests pass.
