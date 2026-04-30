@@ -27,3 +27,10 @@ knowledge/
 # Plan files
 plan-review-*.md
 dynamic-task-plugin-fixes-implementation-plan.md
+
+# Dynamic Task Plugin artifacts
+.dynamic-task-ids.json
+.handoff-*
+.tmp/
+.yolo.json
+coverage/
