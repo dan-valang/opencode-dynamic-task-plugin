@@ -1,18 +1,24 @@
 # OpenCode Dynamic Task Plugin
 
-OpenCode plugin that provides `dynamic_task`, `task_continue`, `task_result`, and `task_interrupt` tools for dynamic subagent execution with async background mode and automatic parent notifications.
+OpenCode plugin that provides `dynamic_task`, `task_continue`, `task_result`, `task_list`, `task_status`, and `task_interrupt` tools for dynamic subagent execution with async background mode and automatic parent notifications.
 
 ## Features
 
 - **dynamic_task** — Spawn any registered subagent with a prompt, optionally in background mode
 - **task_continue** — Send follow-up messages to running child sessions
 - **task_result** — Inspect latest known child session status/output without sending a new prompt
+- **task_list** — List all tracked background tasks with status, timing, and completion data
+- **task_status** — Get detailed status for a single tracked task (lifecycle, timing, dependencies)
 - **task_interrupt** — Abort running child sessions
 - Async/fire-and-forget mode (`await_response: false`) with automatic parent notifications
-- Configurable timeout per request
+- Configurable timeout per request with `model` override and `depends_on` dependency tracking
 - Automatic agent discovery and caching
 - Child session tracking with `parentID`
 - Opt-in debug logging for troubleshooting
+- Lifecycle policy layer: agent validation, recursive delegation prevention, depth limits
+- Dual-map state (active + retained) with validated transition matrix
+- Configurable timeout behavior: interrupt (abort), notify (alert only), notify_untrack
+- Question API integration (auto-answer, reject, event handling for child questions)
 
 ## Installation
 
@@ -31,6 +37,18 @@ OpenCode plugin that provides `dynamic_task`, `task_continue`, `task_result`, an
 
 ```
 dynamic_task(description="Analyze codebase", subagent_type="explore", prompt="Find all TODO comments in src/")
+```
+
+### Spawn with model override
+
+```
+dynamic_task(description="Review PR", subagent_type="reviewer", prompt="Review this code for bugs", model="opencode-go/mimo-v2.5")
+```
+
+### Spawn with dependencies
+
+```
+dynamic_task(description="Integration tests", subagent_type="qa-engineer", prompt="Run integration tests", depends_on=["ses_task1", "ses_task2"])
 ```
 
 ### Spawn a background task (non-blocking)
@@ -106,7 +124,11 @@ The log contains event metadata only (event type/name, normalized status, timeou
 src/
 ├── index.ts                      # Plugin entry point, tool handlers, event router
 ├── debug-logger.ts               # Opt-in file-based debug logging
+├── plugin-entry.ts               # Clean ESM re-export for OpenCode plugin loader
 └── shared/
+    ├── config.ts                 # DynamicTaskConfig normalization, 4-layer precedence, TimerProvider
+    ├── task-policy.ts            # Pure policy functions: agent validation, lineage/depth checks
+    ├── task-state.ts             # TaskStore (active + retained), validated transition matrix
     ├── session-lifecycle.ts      # Status normalization, event parsing, terminal detection
     ├── task-formatting.ts        # Notification formatting, background prompt wrapper
     └── question-handling.ts      # Question API integration (auto-answer, reject, event handling)
@@ -153,7 +175,7 @@ npm run lint      # TypeScript type check
 npm test          # Full test suite (130 tests, sequential)
 ```
 
-Expected: lint passes, all 114 tests pass.
+Expected: lint passes, all 130 tests pass.
 
 ## License
 
