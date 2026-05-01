@@ -66,6 +66,44 @@ interface PluginState {
 
 let pluginState: PluginState | null = null;
 
+/** Safe logger that never throws — prevents secondary failures in error paths */
+async function safeLog(client: any, level: string, message: string): Promise<void> {
+  try {
+    await client.app.log({
+      body: { service: "dynamic-task", level, message },
+    });
+  } catch {
+    // best-effort: logging must never break control flow
+  }
+}
+
+/** Check whether an error indicates a session was not found (404, NOT_FOUND code, etc.) */
+function isNotFoundSessionError(error: any): boolean {
+  if (error?.status === 404) return true;
+  if (error?.response?.status === 404) return true;
+  if (error?.code === "NOT_FOUND" || error?.code === "not_found") return true;
+
+  const message = error?.message || "";
+  if (typeof message === "string") {
+    const normalized = message.toLowerCase();
+    return (
+      normalized.includes("session not found") ||
+      normalized.includes("session_id not found") ||
+      normalized.includes("enoent")
+    );
+  }
+  return false;
+}
+
+/** Abort a session server-side (best-effort, swallows errors) */
+async function abortSession(client: any, sessionId: string): Promise<void> {
+  try {
+    await client.session.abort({ path: { id: sessionId } });
+  } catch {
+    // best-effort: server may be unreachable or session already terminated
+  }
+}
+
 // Persisted task-to-session mapping for crash recovery
 import { loadTaskIdMap, saveTaskIdMap, validateTaskId } from "./shared/session-lifecycle.js";
 
@@ -536,6 +574,14 @@ export default async function dynamicTaskPlugin(
             .number()
             .optional()
             .describe("Max wait in ms for awaiting mode or timeout notification in background mode."),
+          model: tool.schema
+            .string()
+            .optional()
+            .describe("Optional model override for the child session."),
+          depends_on: tool.schema
+            .array(tool.schema.string())
+            .optional()
+            .describe("Task dependencies — session IDs this task depends on."),
         },
         async execute(args: any, ctx: any) {
           // Deprecation warning for missing await_response
@@ -598,6 +644,10 @@ export default async function dynamicTaskPlugin(
               agent: agent.name,
             };
 
+            if (args.model) {
+              sessionBody.model = args.model;
+            }
+
             const parentSessionId = resolveParentSessionId(ctx);
             if (parentSessionId) {
               sessionBody.parentID = parentSessionId;
@@ -624,6 +674,8 @@ export default async function dynamicTaskPlugin(
               description: args.description || `Task: ${agent.name}`,
               lineage: newLineage,
               isBackground: isBg,
+              requestedModel: args.model || undefined,
+              dependsOn: args.depends_on,
             }, config);
 
             // Persist taskId mapping

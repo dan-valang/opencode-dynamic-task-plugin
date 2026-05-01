@@ -30,6 +30,8 @@ export interface ActiveTaskState {
   startedAt: number;
   timeoutNotified: boolean;
   completed: boolean;
+  requestedModel?: string;        // model override for the child session
+  dependsOn?: string[];           // task dependencies (session IDs)
 }
 
 export interface RetainedTaskState {
@@ -44,6 +46,8 @@ export interface RetainedTaskState {
   retainedAt: number;
   timeoutNotified: boolean;
   completed: boolean;
+  requestedModel?: string;
+  dependsOn?: string[];
   previousSessionId?: string; // set when this entry was created by task_continue
   abortError?: string;         // populated when client.session.abort() fails
 }
@@ -91,6 +95,8 @@ export function registerActiveTask(
     description: string;
     lineage: string[];
     isBackground: boolean;
+    requestedModel?: string;
+    dependsOn?: string[];
   },
   config: DynamicTaskConfig,
 ): ActiveTaskState {
@@ -120,6 +126,8 @@ export function registerActiveTask(
     startedAt: Date.now(),
     timeoutNotified: false,
     completed: false,
+    requestedModel: params.requestedModel,
+    dependsOn: params.dependsOn,
   };
 
   store.activeTasks.set(params.childSessionId, task);
