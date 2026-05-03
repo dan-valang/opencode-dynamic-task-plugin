@@ -44,6 +44,7 @@ import {
   type TaskStore,
   type ActiveTaskState,
   type RetainedTaskState,
+  type TaskLifecycleState,
 } from "./shared/task-state.js";
 
 let cachedAgents: any[] = [];
@@ -290,8 +291,8 @@ async function notifyParentSession(client: any, parentSessionId: string, message
   }
 }
 
-function handleTimeout(store: TaskStore, childSessionId: string, client: any, config: DynamicTaskConfig,
-  pendingSyncRequests: Map<string, { resolve: (result: any) => void; reject: (error: Error) => void; timeoutHandle: ReturnType<typeof setTimeout>; }>): void {
+async function handleTimeout(store: TaskStore, childSessionId: string, client: any, config: DynamicTaskConfig,
+  pendingSyncRequests: Map<string, { resolve: (result: any) => void; reject: (error: Error) => void; timeoutHandle: ReturnType<typeof setTimeout>; }>): Promise<void> {
   const task = store.activeTasks.get(childSessionId);
   if (!task || task.completed) return;
 
@@ -304,28 +305,50 @@ function handleTimeout(store: TaskStore, childSessionId: string, client: any, co
     timeoutMs: config.defaultTimeoutMs,
   }, "timeout");
 
-  if (config.timeoutBehavior === "interrupt") {
-    // Attempt to abort with a timeout
-    const abortPromise = client.session.abort({ path: { id: childSessionId } }).catch((err: any) => ({
-      aborted: false,
-      error: err.message,
-    }));
-    Promise.race([
-      abortPromise,
-      new Promise((_, reject) =>
-        config.timerProvider.setTimeout(() => reject(new Error("abort timeout")), 5000)
-      ),
-    ]).catch(() => {});
+  let abortError: string | undefined;
 
-    transitionState(store, childSessionId, "timed_out_retained", config);
-  } else if (config.timeoutBehavior === "notify") {
-    transitionState(store, childSessionId, "timed_out_retained", config);
-  } else {
-    // notify_untrack — move to retained but don't abort
-    transitionState(store, childSessionId, "timed_out_retained", config);
+  if (config.timeoutBehavior === "interrupt") {
+    // Await the abort and track its outcome — prevents silent failure
+    try {
+      const result = await Promise.race([
+        client.session.abort({ path: { id: childSessionId } }).then(() => ({ aborted: true })),
+        new Promise<{ aborted: false; error: string }>((_, reject) =>
+          config.timerProvider.setTimeout(() => reject(new Error("abort timeout")), 5000)
+        ),
+      ]);
+      if (!result.aborted) {
+        abortError = result.error;
+      }
+    } catch (e: any) {
+      abortError = e?.message || "abort failed";
+    }
   }
 
-  notifyParentSession(client, task.parentSessionId, timeoutMessage);
+  // Always transition to retained — preserves state regardless of abort outcome
+  try {
+    transitionState(store, childSessionId, "timed_out_retained", config);
+  } catch {
+    // If transition fails (e.g., already terminal), force the move manually
+    store.activeTasks.delete(childSessionId);
+    store.retainedTasks.set(childSessionId, {
+      ...task,
+      state: "timed_out_retained",
+      retainedAt: Date.now(),
+      timeoutNotified: true,
+      completed: true,
+      abortError,
+    } as RetainedTaskState);
+  }
+
+  // Attach abort error to retained entry if applicable
+  if (abortError) {
+    const retained = store.retainedTasks.get(childSessionId);
+    if (retained) {
+      retained.abortError = abortError;
+    }
+  }
+
+  await notifyParentSession(client, task.parentSessionId, timeoutMessage);
 
   // Clean up any pending sync request
   const pending = pendingSyncRequests.get(childSessionId);
@@ -334,9 +357,15 @@ function handleTimeout(store: TaskStore, childSessionId: string, client: any, co
     pendingSyncRequests.delete(childSessionId);
   }
 
+  // Clear the stored timeout handle (it already fired, no-op now)
+  if (task.timeoutHandle) {
+    config.timerProvider.clearTimeout(task.timeoutHandle);
+  }
+
   debugLog(task.parentSessionId, childSessionId, "timeout-fired", {
     timeoutBehavior: config.timeoutBehavior,
     childSessionId,
+    abortError,
   });
 }
 
@@ -352,7 +381,13 @@ async function handleChildLifecycleEvent(client: any, event: any): Promise<void>
   // Check active tasks first
   const active = store.activeTasks.get(childSessionId);
   if (active) {
-    if (active.completed) return;
+    // Clear the stored timeout handle — prevents the "timeout wins the race" bug
+    if (active.timeoutHandle) {
+      config.timerProvider.clearTimeout(active.timeoutHandle);
+    }
+
+    // If already marked completed (timeout fired first), still report the result
+    const alreadyCompleted = active.completed;
     active.completed = true;
 
     const status = getEventLifecycleStatus(event);
@@ -360,7 +395,7 @@ async function handleChildLifecycleEvent(client: any, event: any): Promise<void>
     if (status === "error") {
       kind = "error";
       transitionState(store, childSessionId, "error", config);
-    } else if (active.timeoutNotified) {
+    } else if (active.timeoutNotified || alreadyCompleted) {
       kind = "completed_after_timeout";
       transitionState(store, childSessionId, "completed_after_timeout", config);
     } else {
@@ -386,25 +421,64 @@ async function handleChildLifecycleEvent(client: any, event: any): Promise<void>
       status,
       kind,
       timeoutNotified: active.timeoutNotified,
+      alreadyCompleted,
     });
     return;
   }
 
-  // Check retained tasks — update state but don't notify
+  // Check retained tasks — update state and notify parent of late completion
   const retained = store.retainedTasks.get(childSessionId);
   if (retained) {
     const status = getEventLifecycleStatus(event);
+    let newState: TaskLifecycleState = retained.state;
+
     if (status === "error") {
-      retained.state = "error";
+      newState = "error";
     } else if (retained.state === "timed_out_retained") {
-      retained.state = "completed_after_timeout";
+      newState = "completed_after_timeout";
+    } else {
+      // For other states (completed, error, interrupted), no update needed
+      return;
     }
+
+    retained.state = newState;
+
+    // Notify parent that the timed-out task actually finished
+    const latestText = "(completed after timeout)";
+    const kind = newState === "error" ? "error" : "completed_after_timeout";
+    const parentMessage = formatParentNotification({
+      childSessionId: retained.childSessionId,
+      description: retained.description,
+      timeoutMs: config.defaultTimeoutMs,
+    }, kind, latestText);
+    await notifyParentSession(client, retained.parentSessionId, parentMessage);
+
+    debugLog(retained.parentSessionId, childSessionId, "retained-lifecycle-event", {
+      status,
+      newState,
+      previousState: retained.state,
+    });
   }
 }
 
-function createDummyLineage(ctx: any): string[] {
-  // Try to derive parent agent from ctx
-  // This is best-effort — lineage[] may be empty for root-level calls
+function createDummyLineage(ctx: any, store: TaskStore): string[] {
+  const parentSessionId = resolveParentSessionId(ctx);
+  if (!parentSessionId) return [];
+
+  // Check if the parent session is itself a child task (i.e., this is a nested call)
+  const parentTask = store.activeTasks.get(parentSessionId);
+  if (parentTask) {
+    // Inherit parent's lineage plus parent's own agent type
+    return buildTaskLineage(parentTask.lineage, parentTask.agentName);
+  }
+
+  // Also check retained tasks for the parent
+  const parentRetained = store.retainedTasks.get(parentSessionId);
+  if (parentRetained) {
+    return buildTaskLineage(parentRetained.lineage, parentRetained.agentName);
+  }
+
+  // Root-level call — no lineage constraints
   return [];
 }
 
@@ -626,7 +700,7 @@ export default async function dynamicTaskPlugin(
           const shouldAwait = resolveAwaitResponse(args.await_response, config);
 
           // Policy checks before session.create
-          const lineage = createDummyLineage(ctx);
+          const lineage = createDummyLineage(ctx, store);
 
           const agentCheck = validateAgent(agent.name, config);
           if (!agentCheck.ok) {
@@ -696,6 +770,8 @@ export default async function dynamicTaskPlugin(
                 () => handleTimeout(store, childSessionId, client, config, pendingSyncRequests),
                 timeoutMs,
               );
+              // Store the handle so the lifecycle handler can clear it on early completion
+              activeTask.timeoutHandle = timeoutHandle;
 
               debugLog(parentSessionId || "unknown", childSessionId, "background-task-registered", {
                 timeoutMs,

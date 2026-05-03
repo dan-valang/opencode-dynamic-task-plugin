@@ -32,6 +32,7 @@ export interface ActiveTaskState {
   completed: boolean;
   requestedModel?: string;        // model override for the child session
   dependsOn?: string[];           // task dependencies (session IDs)
+  timeoutHandle?: ReturnType<typeof setTimeout>; // stored so lifecycle handler can clear it
 }
 
 export interface RetainedTaskState {
