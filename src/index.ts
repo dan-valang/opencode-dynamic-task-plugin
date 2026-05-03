@@ -407,6 +407,8 @@ async function handleChildLifecycleEvent(client: any, event: any): Promise<void>
     if (pending) {
       config.timerProvider.clearTimeout(pending.timeoutHandle);
       pendingSyncRequests.delete(childSessionId);
+      // Resolve the sync Promise — this unblocks the parent
+      pending.resolve({ text: "(completed)" });
     }
 
     const latestText = "(completed)";
