@@ -116,6 +116,16 @@ export function resolveAwaitResponse(
   config: DynamicTaskConfig,
 ): boolean {
   if (typeof value === "boolean") return value;
-  // value is null, undefined, or non-boolean → use config default
+  // OpenCode tool args may arrive as strings from LLM parsing
+  if (typeof value === "string") {
+    const lower = value.trim().toLowerCase();
+    if (lower === "true") return true;
+    if (lower === "false") return false;
+  }
+  // Numeric fallbacks (1 = true, 0 = false)
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+  // value is null, undefined, or unparseable → use config default
   return config.defaultAwaitResponse;
 }

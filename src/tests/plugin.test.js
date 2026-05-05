@@ -927,6 +927,32 @@ describe("resolveAwaitResponse", () => {
     const syncConfig = normalizeDynamicTaskConfig({ defaultAwaitResponse: true });
     assert.strictEqual(resolveAwaitResponse(undefined, syncConfig), true);
   });
+
+  it("coerces string 'true' to boolean true", () => {
+    assert.strictEqual(resolveAwaitResponse("true", config), true);
+    assert.strictEqual(resolveAwaitResponse("True", config), true);
+    assert.strictEqual(resolveAwaitResponse("TRUE", config), true);
+    assert.strictEqual(resolveAwaitResponse("  true  ", config), true);
+  });
+
+  it("coerces string 'false' to boolean false", () => {
+    assert.strictEqual(resolveAwaitResponse("false", config), false);
+    assert.strictEqual(resolveAwaitResponse("False", config), false);
+    assert.strictEqual(resolveAwaitResponse("FALSE", config), false);
+    assert.strictEqual(resolveAwaitResponse("  false  ", config), false);
+  });
+
+  it("unrecognized strings fall back to config default", () => {
+    assert.strictEqual(resolveAwaitResponse("yes", config), false); // falls to default
+    assert.strictEqual(resolveAwaitResponse("maybe", config), false);
+  });
+
+  it("coerces numbers: non-zero = true, 0 = false", () => {
+    assert.strictEqual(resolveAwaitResponse(1, config), true);
+    assert.strictEqual(resolveAwaitResponse(42, config), true);
+    assert.strictEqual(resolveAwaitResponse(0, config), false);
+    assert.strictEqual(resolveAwaitResponse(-1, config), true); // non-zero = true
+  });
 });
 
 // ============================================================

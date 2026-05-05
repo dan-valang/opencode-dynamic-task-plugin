@@ -378,38 +378,41 @@ async function handleChildLifecycleEvent(client: any, event: any): Promise<void>
   const childSessionId = getSessionIdFromEvent(event);
   if (!childSessionId) return;
 
-  // Check active tasks first
-  const active = store.activeTasks.get(childSessionId);
-  if (active) {
-    // Clear the stored timeout handle — prevents the "timeout wins the race" bug
-    if (active.timeoutHandle) {
-      config.timerProvider.clearTimeout(active.timeoutHandle);
-    }
+    // Check active tasks first
+    const active = store.activeTasks.get(childSessionId);
+    if (active) {
+      await safeLog(client, "info", `Event handler: found active task ${childSessionId}, status=${getEventLifecycleStatus(event)}, completed=${active.completed}`);
+      
+      // Clear the stored timeout handle — prevents the "timeout wins the race" bug
+      if (active.timeoutHandle) {
+        config.timerProvider.clearTimeout(active.timeoutHandle);
+      }
 
-    // If already marked completed (timeout fired first), still report the result
-    const alreadyCompleted = active.completed;
-    active.completed = true;
+      // If already marked completed (timeout fired first), still report the result
+      const alreadyCompleted = active.completed;
+      active.completed = true;
 
-    const status = getEventLifecycleStatus(event);
-    let kind: "timeout" | "completed" | "completed_after_timeout" | "error" = "completed";
-    if (status === "error") {
-      kind = "error";
-      transitionState(store, childSessionId, "error", config);
-    } else if (active.timeoutNotified || alreadyCompleted) {
-      kind = "completed_after_timeout";
-      transitionState(store, childSessionId, "completed_after_timeout", config);
-    } else {
-      transitionState(store, childSessionId, "completed", config);
-    }
+      const status = getEventLifecycleStatus(event);
+      let kind: "timeout" | "completed" | "completed_after_timeout" | "error" = "completed";
+      if (status === "error") {
+        kind = "error";
+        transitionState(store, childSessionId, "error", config);
+      } else if (active.timeoutNotified || alreadyCompleted) {
+        kind = "completed_after_timeout";
+        transitionState(store, childSessionId, "completed_after_timeout", config);
+      } else {
+        transitionState(store, childSessionId, "completed", config);
+      }
 
-    // Check if there's a pending sync request for this task
-    const pending = pendingSyncRequests.get(childSessionId);
-    if (pending) {
-      config.timerProvider.clearTimeout(pending.timeoutHandle);
-      pendingSyncRequests.delete(childSessionId);
-      // Resolve the sync Promise — this unblocks the parent
-      pending.resolve({ text: "(completed)" });
-    }
+      // Check if there's a pending sync request for this task
+      const pending = pendingSyncRequests.get(childSessionId);
+      await safeLog(client, "info", `Event handler: pendingSyncRequest for ${childSessionId} = ${pending ? 'FOUND' : 'NOT FOUND'}`);
+      if (pending) {
+        config.timerProvider.clearTimeout(pending.timeoutHandle);
+        pendingSyncRequests.delete(childSessionId);
+        // Resolve the sync Promise — this unblocks the parent
+        pending.resolve({ text: "(completed)" });
+      }
 
     const latestText = "(completed)";
     const parentMessage = formatParentNotification({
@@ -660,6 +663,9 @@ export default async function dynamicTaskPlugin(
             .describe("Task dependencies — session IDs this task depends on."),
         },
         async execute(args: any, ctx: any) {
+          // Debug logging for await_response
+          await safeLog(client, "info", `dynamic_task called with await_response=${JSON.stringify(args.await_response)} (type: ${typeof args.await_response})`);
+          
           // Deprecation warning for missing await_response
           if (state.config.defaultAwaitResponse === false && args.await_response === undefined) {
             if (!state.deprecationWarned) {
@@ -797,41 +803,84 @@ export default async function dynamicTaskPlugin(
               ].join("\n");
             }
 
-            // Sync mode — event-based wait
+            // Sync mode — polling-based wait
+            // NOTE: Events from child sessions do NOT propagate to the parent's plugin.
+            // The event handler (background notification) is a separate path.
+            // For sync mode, we poll session messages until the child responds or timeout.
+            await safeLog(client, "info", `Entering sync mode (poll) for ${childSessionId}, timeout=${timeoutMs}ms`);
             const baselineCount = await getMessageCount(client, childSessionId);
 
-            // Create a sync Promise that resolves on terminal event or timeout
-            const syncResult = await new Promise<string>((resolve, reject) => {
+            const POLL_INTERVAL = 500; // poll every 500ms
+            const pollResult = await new Promise<string>((resolve) => {
+              // Safety net: if the timeout fires, return a timeout message
               const timeoutHandle = config.timerProvider.setTimeout(async () => {
+                safeLog(client, "warn", `Sync timeout fired for ${childSessionId} (poll timeout)`);
                 pendingSyncRequests.delete(childSessionId);
-                // Abort on sync timeout
                 if (config.timeoutBehavior === "interrupt") {
-                  try {
-                    await client.session.abort({ path: { id: childSessionId } });
-                  } catch { /* ignore abort failure */ }
+                  try { await client.session.abort({ path: { id: childSessionId } }); } catch { /* ok */ }
                 }
                 transitionState(store, childSessionId, "timed_out_retained", config);
                 resolve(`(Timed out after ${timeoutMs / 1000}s. Session: ${childSessionId}. Use task_continue to resume.)`);
               }, timeoutMs);
 
-              // Register the resolver so the event handler can complete it
-              pendingSyncRequests.set(childSessionId, {
-                resolve: (result: any) => {
-                  config.timerProvider.clearTimeout(timeoutHandle);
-                  resolve(result.text || "(Subagent completed)");
-                },
-                reject: (err: Error) => {
-                  config.timerProvider.clearTimeout(timeoutHandle);
-                  reject(err);
-                },
-                timeoutHandle,
-              });
+              // Poll for child response
+              let stopped = false;
 
-              // De-register on child completion via the event handler
-              // If no event comes, timeout resolves the promise
+              const cSid: string = childSessionId; // captured non-null from validateSessionResult above
+
+              async function poll() {
+                if (stopped) return;
+
+                try {
+                  const messages = await readSessionMessages(client, cSid);
+                  // Assistant responded after we sent the prompt → completed
+                  if (messages.length > baselineCount) {
+                    stopped = true;
+                    config.timerProvider.clearTimeout(timeoutHandle);
+                    pendingSyncRequests.delete(cSid);
+                    try {
+                      transitionState(store, cSid, "completed", config);
+                    } catch {
+                      // If event handler already moved it to terminal, that's fine
+                    }
+                    const latestText = getLatestAssistantText(messages, baselineCount);
+                    safeLog(client, "info", `Sync poll detected completion for ${childSessionId}, messages: ${messages.length}, latest length: ${latestText.length}`);
+                    resolve(latestText || "(Subagent completed)");
+                    return;
+                  }
+
+                  // Also register the pending sync request so event handler (if it arrives) can resolve early
+                  if (!pendingSyncRequests.has(cSid)) {
+                    pendingSyncRequests.set(cSid, {
+                      resolve: (result: any) => {
+                        if (stopped) return;
+                        stopped = true;
+                        config.timerProvider.clearTimeout(timeoutHandle);
+                        resolve(result.text || "(Subagent completed)");
+                      },
+                      reject: (err: Error) => {
+                        if (stopped) return;
+                        stopped = true;
+                        config.timerProvider.clearTimeout(timeoutHandle);
+                        resolve(`(Error: ${err.message})`);
+                      },
+                      timeoutHandle,
+                    });
+                  }
+                } catch (err: any) {
+                  // Polling error — keep trying
+                }
+
+                // Schedule next poll
+                config.timerProvider.setTimeout(poll, POLL_INTERVAL);
+              }
+
+              // Start polling
+              poll();
             });
 
-            return `## @${agent.name} Response\n\n${syncResult}\n\n---\n*Session: ${childSessionId}*`;
+            await safeLog(client, "info", `Sync mode completed for ${childSessionId}, result length: ${pollResult.length}`);
+            return `## @${agent.name} Response\n\n${pollResult}\n\n---\n*Session: ${childSessionId}*`;
           } catch (error: any) {
             if (error.message?.includes("not found")) {
               return `ERROR: Agent "${agent.name}" not found.`;
