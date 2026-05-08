@@ -60,8 +60,15 @@ function createMockClient() {
       prompt: async ({ path, body }) => {
         const msgs = sessionMessages.get(path.id) || [];
         msgs.push({ role: "user", parts: body?.parts || [] });
+        const promptText = body?.parts?.map((p) => p?.text || "").join("\n") || "";
+        if (promptText.includes("Long task")) {
+          sessionMessages.set(path.id, msgs);
+          return new Promise(() => {});
+        }
+        const assistant = { role: "assistant", parts: [{ type: "text", text: "COMPLETED_OK" }] };
+        msgs.push(assistant);
         sessionMessages.set(path.id, msgs);
-        return { ok: true };
+        return assistant;
       },
 
       messages: async ({ path }) => {

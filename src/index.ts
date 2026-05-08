@@ -169,6 +169,37 @@ function extractTextFromParts(parts: any[]): string {
     .join("\n");
 }
 
+function extractTextFromPromptResult(result: any): string {
+  const candidates = [
+    result?.parts,
+    result?.data?.parts,
+    result?.body?.parts,
+    result?.message?.parts,
+    result?.data?.message?.parts,
+    result?.body?.message?.parts,
+  ];
+
+  for (const parts of candidates) {
+    const text = extractTextFromParts(parts);
+    if (text.trim()) return text;
+  }
+
+  const messageCandidates = [
+    result?.text,
+    result?.data?.text,
+    result?.body?.text,
+    result?.content,
+    result?.data?.content,
+    result?.body?.content,
+  ];
+
+  for (const text of messageCandidates) {
+    if (typeof text === "string" && text.trim()) return text;
+  }
+
+  return "";
+}
+
 function extractSessionStatus(sessionInfo: any, messages: any[] = []): string {
   const candidates = [
     sessionInfo?.status,
@@ -322,6 +353,12 @@ async function handleTimeout(store: TaskStore, childSessionId: string, client: a
     } catch (e: any) {
       abortError = e?.message || "abort failed";
     }
+  }
+
+  // Guard: event handler may have processed completion during the abort await
+  if (!store.activeTasks.has(childSessionId)) {
+    pendingSyncRequests.delete(childSessionId);
+    return;
   }
 
   // Always transition to retained — preserves state regardless of abort outcome
@@ -727,7 +764,10 @@ export default async function dynamicTaskPlugin(
             };
 
             if (args.model) {
-              sessionBody.model = args.model;
+              const parts = args.model.split("/");
+              sessionBody.model = parts.length >= 2
+                ? { providerID: parts[0], modelID: parts.slice(1).join("/") }
+                : { providerID: "", modelID: args.model };
             }
 
             const parentSessionId = resolveParentSessionId(ctx);
@@ -766,13 +806,51 @@ export default async function dynamicTaskPlugin(
               saveTaskIdMap(taskIdToSessionId);
             }
 
-            const childPrompt = shouldAwait ? args.prompt : buildBackgroundPrompt(args.prompt);
-            await client.session.prompt({
-              path: { id: childSessionId },
-              body: { parts: [{ type: "text", text: childPrompt }] },
-            });
+            if (shouldAwait) {
+              let timedOut = false;
+              const timeoutResult = Symbol("dynamic-task-timeout");
+              const timeoutHandle = config.timerProvider.setTimeout(async () => {
+                timedOut = true;
+                if (config.timeoutBehavior === "interrupt") {
+                  try { await client.session.abort({ path: { id: childSessionId } }); } catch { /* ok */ }
+                }
+                try { transitionState(store, childSessionId, "timed_out_retained", config); } catch { /* ok */ }
+              }, timeoutMs);
+
+              const promptResult = await Promise.race([
+                client.session.prompt({
+                  path: { id: childSessionId },
+                  body: { parts: [{ type: "text", text: args.prompt }] },
+                }),
+                new Promise<typeof timeoutResult>((resolve) => {
+                  config.timerProvider.setTimeout(() => resolve(timeoutResult), timeoutMs);
+                }),
+              ]);
+
+              if (promptResult !== timeoutResult) {
+                config.timerProvider.clearTimeout(timeoutHandle);
+              }
+
+              if (promptResult === timeoutResult || timedOut) {
+                return `## @${agent.name} Response\n\n(Timed out after ${timeoutMs / 1000}s. Session: ${childSessionId}. Use task_continue to resume.)\n\n---\n*Session: ${childSessionId}*`;
+              }
+
+              const responseText = extractTextFromPromptResult(promptResult);
+              try {
+                transitionState(store, childSessionId, "completed", config);
+              } catch { /* already terminal or not tracked */ }
+              return `## @${agent.name} Response\n\n${responseText || "(Subagent completed)"}\n\n---\n*Session: ${childSessionId}*`;
+            }
 
             if (!shouldAwait) {
+              const childPrompt = buildBackgroundPrompt(args.prompt);
+              client.session.prompt({
+                path: { id: childSessionId },
+                body: { parts: [{ type: "text", text: childPrompt }] },
+              }).catch((error: any) => {
+                safeLog(client, "warn", `Background prompt failed for ${childSessionId}: ${error?.message || error}`);
+              });
+
               // Fire-and-forget background mode
               const timeoutHandle = config.timerProvider.setTimeout(
                 () => handleTimeout(store, childSessionId, client, config, pendingSyncRequests),
@@ -803,84 +881,8 @@ export default async function dynamicTaskPlugin(
               ].join("\n");
             }
 
-            // Sync mode — polling-based wait
-            // NOTE: Events from child sessions do NOT propagate to the parent's plugin.
-            // The event handler (background notification) is a separate path.
-            // For sync mode, we poll session messages until the child responds or timeout.
-            await safeLog(client, "info", `Entering sync mode (poll) for ${childSessionId}, timeout=${timeoutMs}ms`);
-            const baselineCount = await getMessageCount(client, childSessionId);
+            return "ERROR: Unreachable dynamic_task state.";
 
-            const POLL_INTERVAL = 500; // poll every 500ms
-            const pollResult = await new Promise<string>((resolve) => {
-              // Safety net: if the timeout fires, return a timeout message
-              const timeoutHandle = config.timerProvider.setTimeout(async () => {
-                safeLog(client, "warn", `Sync timeout fired for ${childSessionId} (poll timeout)`);
-                pendingSyncRequests.delete(childSessionId);
-                if (config.timeoutBehavior === "interrupt") {
-                  try { await client.session.abort({ path: { id: childSessionId } }); } catch { /* ok */ }
-                }
-                transitionState(store, childSessionId, "timed_out_retained", config);
-                resolve(`(Timed out after ${timeoutMs / 1000}s. Session: ${childSessionId}. Use task_continue to resume.)`);
-              }, timeoutMs);
-
-              // Poll for child response
-              let stopped = false;
-
-              const cSid: string = childSessionId; // captured non-null from validateSessionResult above
-
-              async function poll() {
-                if (stopped) return;
-
-                try {
-                  const messages = await readSessionMessages(client, cSid);
-                  // Assistant responded after we sent the prompt → completed
-                  if (messages.length > baselineCount) {
-                    stopped = true;
-                    config.timerProvider.clearTimeout(timeoutHandle);
-                    pendingSyncRequests.delete(cSid);
-                    try {
-                      transitionState(store, cSid, "completed", config);
-                    } catch {
-                      // If event handler already moved it to terminal, that's fine
-                    }
-                    const latestText = getLatestAssistantText(messages, baselineCount);
-                    safeLog(client, "info", `Sync poll detected completion for ${childSessionId}, messages: ${messages.length}, latest length: ${latestText.length}`);
-                    resolve(latestText || "(Subagent completed)");
-                    return;
-                  }
-
-                  // Also register the pending sync request so event handler (if it arrives) can resolve early
-                  if (!pendingSyncRequests.has(cSid)) {
-                    pendingSyncRequests.set(cSid, {
-                      resolve: (result: any) => {
-                        if (stopped) return;
-                        stopped = true;
-                        config.timerProvider.clearTimeout(timeoutHandle);
-                        resolve(result.text || "(Subagent completed)");
-                      },
-                      reject: (err: Error) => {
-                        if (stopped) return;
-                        stopped = true;
-                        config.timerProvider.clearTimeout(timeoutHandle);
-                        resolve(`(Error: ${err.message})`);
-                      },
-                      timeoutHandle,
-                    });
-                  }
-                } catch (err: any) {
-                  // Polling error — keep trying
-                }
-
-                // Schedule next poll
-                config.timerProvider.setTimeout(poll, POLL_INTERVAL);
-              }
-
-              // Start polling
-              poll();
-            });
-
-            await safeLog(client, "info", `Sync mode completed for ${childSessionId}, result length: ${pollResult.length}`);
-            return `## @${agent.name} Response\n\n${pollResult}\n\n---\n*Session: ${childSessionId}*`;
           } catch (error: any) {
             if (error.message?.includes("not found")) {
               return `ERROR: Agent "${agent.name}" not found.`;
@@ -914,6 +916,43 @@ export default async function dynamicTaskPlugin(
           // Check if this is a retained task — spawn new session
           const retained = store.retainedTasks.get(args.session_id);
           if (retained) {
+            // Try existing session first — send prompt and await response directly
+            try {
+              const timeoutMs = resolveTimeoutMs(args.timeout_ms, config);
+              let timedOut = false;
+
+              // Schedule timeout
+              const timeoutHandle = config.timerProvider.setTimeout(() => {
+                timedOut = true;
+                if (config.timeoutBehavior === "interrupt") {
+                  client.session.abort({ path: { id: args.session_id } }).catch(() => {});
+                }
+                try { transitionState(store, args.session_id, "timed_out_retained", config); } catch { }
+              }, timeoutMs);
+
+              const result = await Promise.race([
+                client.session.prompt({
+                  path: { id: args.session_id },
+                  body: { parts: [{ type: "text", text: args.prompt }] },
+                }).catch(() => null),
+                new Promise<null>((resolve) =>
+                  config.timerProvider.setTimeout(() => resolve(null), timeoutMs)
+                ),
+              ]);
+
+              config.timerProvider.clearTimeout(timeoutHandle);
+
+              if (result === null || timedOut) {
+                return `(Timed out after ${timeoutMs / 1000}s. Session: ${args.session_id}. Use task_continue to resume.)`;
+              }
+
+              const responseText = extractTextFromPromptResult(result);
+              try { transitionState(store, args.session_id, "completed", config); } catch { }
+              return `## Follow-up Response\n\n${responseText || "(Subagent completed)"}\n\n---\n*Session: ${args.session_id}*`;
+            } catch {
+              // Session dead — fall through to spawn logic below
+            }
+
             // Spawn a new child session with the same agent
             try {
               const sessionBody: any = {
